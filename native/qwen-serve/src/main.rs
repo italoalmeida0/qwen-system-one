@@ -22,7 +22,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::{DynValue, Tensor};
 use tokenizers::Tokenizer;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use schema::*;
 
@@ -51,6 +51,16 @@ struct Args {
     /// Bearer API key (optional; also LAYA_API_KEY)
     #[arg(long)]
     api_key: Option<String>,
+    /// Execution provider: "cpu" (default — today's numerics exactly),
+    /// "auto" (every compiled-in accelerator, first that registers wins,
+    /// silent CPU fallback) or an explicit "dml" (Windows DirectML/GPU),
+    /// "coreml" (Apple Neural Engine/GPU), "nnapi" (Android) or "qnn"
+    /// (Qualcomm Hexagon; needs the QNN runtime libs). Explicit names fail
+    /// hard when the EP is unavailable instead of silently degrading.
+    /// Each accelerator needs its build feature (ep-directml, ep-coreml,
+    /// ep-nnapi, ep-qnn); the default build is CPU-only.
+    #[arg(long, default_value = "cpu")]
+    ep: String,
     /// Temperature for softmax (default 1.140 for Qwen 3.5 / JPT)
     #[arg(long, default_value_t = 1.140)]
     temperature: f32,
@@ -149,6 +159,69 @@ fn oe<T, E: std::fmt::Debug>(r: Result<T, E>) -> anyhow::Result<T> {
     r.map_err(|e| anyhow!("{e:?}"))
 }
 
+/// Map `--ep` to the ort execution-provider chain. An empty vec means plain
+/// CPU and skips `with_execution_providers` entirely, keeping session setup
+/// byte-identical to the historical default (numerics pinned by the prompt
+/// contract). "auto" degrades silently to CPU; an explicit EP name fails
+/// hard when it is missing or unavailable.
+fn ep_dispatch(ep_arg: &str) -> anyhow::Result<Vec<ort::ep::ExecutionProviderDispatch>> {
+    use ort::ep::ExecutionProviderDispatch;
+
+    let want = ep_arg.trim().to_ascii_lowercase();
+    if want == "cpu" {
+        return Ok(Vec::new());
+    }
+    let auto = want == "auto";
+    if !auto && !matches!(want.as_str(), "dml" | "coreml" | "nnapi" | "qnn") {
+        return Err(anyhow!(
+            "unknown --ep {ep_arg:?} (expected cpu|auto|dml|coreml|nnapi|qnn)"
+        ));
+    }
+
+    // Compiled-in accelerators, in preference order. With an explicit name
+    // the dispatch is marked error_on_failure so a missing EP is loud.
+    let mut out: Vec<ExecutionProviderDispatch> = Vec::new();
+    #[cfg(feature = "ep-directml")]
+    if auto || want == "dml" {
+        out.push(ort::ep::DirectML::default().build().error_on_failure());
+    }
+    #[cfg(feature = "ep-coreml")]
+    if auto || want == "coreml" {
+        out.push(ort::ep::CoreML::default().build().error_on_failure());
+    }
+    #[cfg(feature = "ep-nnapi")]
+    if auto || want == "nnapi" {
+        out.push(ort::ep::NNAPI::default().build().error_on_failure());
+    }
+    #[cfg(feature = "ep-qnn")]
+    if auto || want == "qnn" {
+        out.push(ort::ep::QNN::default().build().error_on_failure());
+    }
+    if auto {
+        // "auto" must never fail: drop the hard-fail flag and fall back.
+        out = out.into_iter().map(|d| d.fail_silently()).collect();
+    }
+
+    if out.is_empty() {
+        if auto {
+            // "auto" never fails: nothing compiled in -> plain CPU.
+            warn!("--ep auto: no accelerator compiled into this binary, staying on CPU");
+            return Ok(Vec::new());
+        }
+        let feature = match want.as_str() {
+            "dml" => "ep-directml",
+            "coreml" => "ep-coreml",
+            "nnapi" => "ep-nnapi",
+            "qnn" => "ep-qnn",
+            _ => "ep-directml / ep-coreml / ep-nnapi / ep-qnn",
+        };
+        return Err(anyhow!(
+            "--ep {ep_arg} is not compiled into this binary (build with --features {feature})"
+        ));
+    }
+    Ok(out)
+}
+
 // Trimmed runtimes: tokio multi_thread with exactly 2 core threads
 // (accept + dispatch only; inference runs on spawn_blocking). The ORT
 // intra pool owns the other cores, so a big default tokio pool would
@@ -184,6 +257,13 @@ async fn main() -> anyhow::Result<()> {
     // ---- ONNX Runtime init ----
     ort::init().with_name("qwen-serve").commit();
 
+    let eps = ep_dispatch(&args.ep)?;
+    if eps.is_empty() {
+        info!("execution provider: cpu (default, numerics unchanged)");
+    } else {
+        info!("execution provider chain ({} entry/entries): {:?}", eps.len(), eps);
+    }
+
     let opt_level = GraphOptimizationLevel::Level3;
 
     let embed_path = args.model_dir.join("embed_tokens_q4.onnx");
@@ -194,6 +274,9 @@ async fn main() -> anyhow::Result<()> {
     let mut workers: Vec<Worker> = Vec::with_capacity(workers_count);
     for i in 0..workers_count {
         let mut embed_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
+        if !eps.is_empty() {
+            embed_builder = oe(embed_builder.with_execution_providers(&eps))?;
+        }
         embed_builder = oe(embed_builder.with_intra_threads(threads_per_session))?;
         // Single-chain model: sequential execution avoids inter-op pool overhead.
         embed_builder = oe(embed_builder.with_inter_threads(1))?;
@@ -205,6 +288,9 @@ async fn main() -> anyhow::Result<()> {
         let embed_session = oe(embed_builder.commit_from_file(&embed_path))?;
 
         let mut decoder_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
+        if !eps.is_empty() {
+            decoder_builder = oe(decoder_builder.with_execution_providers(&eps))?;
+        }
         decoder_builder = oe(decoder_builder.with_intra_threads(threads_per_session))?;
         decoder_builder = oe(decoder_builder.with_inter_threads(1))?;
         // Variable seq_len per request: disable static memory-pattern reuse
