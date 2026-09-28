@@ -91,9 +91,11 @@ Todas as decisões abaixo foram tomadas com **número medido**, não chute. Brea
 **Local (Snapdragon X 12-core, release, 1 worker × 12 threads):**
 | Condição | Latência/req | Throughput |
 |---|---|---|
-| Máquina fresca, miss (inferência nova) | **~233–262ms** | **~4.3 req/s ✅ meta** |
-| Cache-hit (request repetido) | **~1–2ms** | **~1000 req/s** |
-| Carga sustentada (limite de potência do SoC, constante longa) | ~1100ms | ~0.9 req/s |
+| **KV hit (request novo com template aquecido — caso de produção)** | **109–129ms** | **7–9 req/s ✅✅** |
+| KV miss (1º request de uma pergunta nova; 2 runs: template + sufixo) | ~466ms | — |
+| Cache-hit exato (request 100% repetido) | **~1–16ms** | **~1000 req/s** |
+| *(histórico pré-KV: single-pass fresco)* | *~233–262ms* | *~4.3 req/s* |
+| *(histórico pré-KV: carga sustentada)* | *~1100ms (colapso térmico)* | *~0.9 req/s* |
 
 > Nota térmica: degradação sob carga sustentada foi isolada como **throttling do SoC** (processo fresco = sempre ~300ms 4/4; cooldown de 60s não recupera; memória estável em ~680MB, sem vazamento; spinning/vazamento/memory-pattern descartados por teste). Não é bug de código — é física de fanless sob AVX/intenso. Menos FLOPs por request (Fase 2: modelo treinado, prompt menor) é o ataque correto.
 
@@ -114,7 +116,7 @@ Cache no CI: `hits=26, misses=8, entries=8` em todas — comportamento idêntico
 
 > ⚠️ Os números de throughput do bench acima são históricos: na época os níveis repetiam states já respondidos e viravam **parcialmente cache-hit** ("peak 888 req/s" era cache, não inferência). Desde 2026-09-28 o `bench-concurrent.js` **estoura o cache nos níveis** (nonce por request) e mede inferência real; o cache-hit é medido numa fase separada. Também desde então o `quick-check.js` cobre request **multi-pergunta** (caminho K>1) e o workflow ignora commits de `notebooks/`, `data/`, docs e `tools/*.py` (que não afetam os binários).
 
-**Medição real por plataforma (run `36468080454`, 2026-09-28 — níveis cache-busted, p50 por request):**
+**Baseline pré-KV por plataforma** (run `36468080454` — níveis cache-busted, p50 por request; superseded pela tabela do KV real logo abaixo):
 
 | plataforma | c=1 p50 | c=1 req/s | c=4 p50 | c=4 req/s | hit p50 | multi-pergunta |
 |---|---|---|---|---|---|---|
@@ -126,6 +128,21 @@ Cache no CI: `hits=26, misses=8, entries=8` em todas — comportamento idêntico
 | `linux-x64` | 926ms | 1.08 | 2830ms | 1.07 | 4ms | 2640ms |
 | `linux-x64-musl` | 913ms | 1.07 | 2885ms | 1.07 | 3ms | 2464ms |
 | `darwin-x64` | 1491ms | 0.58 | 5671ms | 0.60 | 4ms | 5520ms |
+
+**Com KV real** (run `36487716161` — mesmo bench, prefix-cache aquecido; ganho = menos FLOPs por request, medido nas 8 plataformas):
+
+| plataforma | pré-KV c=1 | **com KV c=1** | ganho | peak req/s (KV) |
+|---|---|---|---|---|
+| `linux-x64` | 926ms | **224ms** | **4.1×** | **4.47** |
+| `darwin-x64` | 1491ms | **325ms** | **4.6×** | 2.81 |
+| `linux-arm64` | 814ms | **318ms** | 2.6× | 3.27 |
+| `win32-arm64` | 776ms | **312ms** | 2.5× | 3.19 |
+| `linux-arm64-musl` | 824ms | **327ms** | 2.5× | 3.05 |
+| `linux-x64-musl` | 913ms | **348ms** | 2.6× | 2.88 |
+| `win32-x64` | 586ms | **328ms** | 1.8× | 3.06 |
+| `darwin-arm64`* | 395ms | 397ms | — | 2.31 |
+
+\* `darwin-arm64` mediu anomalia de runner nesse run (o `embed`, etapa inalterada, foi 0.2ms → 25ms: M1 compartilhado contended) — os outros 7 mostram ganho proporcional ao tamanho do sufixo. quick-check (1 miss + 9 hits + multi): linux-x64 **263ms avg / 3.8 req/s**, win32-arm64 325ms / 3.1, linux-arm64 331ms, win32-x64 375ms — 10/10 respostas válidas em todos.
 
 Padrões que confirmam o modelo do sistema (1 worker, fila serial):
 * `req/s` **plano de c=1 a c=4** e p50 **linear em c** (c=2 ≈ 2× c=1, c=4 ≈ 4× c=1): concorrência só enfileira, não paraleliza;
@@ -145,7 +162,7 @@ Investigação para responder "o que mais dá pra otimizar no runtime?". Mediç�
 | 244 | 1859ms | 7.6 |
 | 377 | 2825ms | 7.5 |
 
-Consequências: (a) **batchar N perguntas numa passada só não reduz FLOPs** — o ganho seria só overhead de `session.run()` (~5-10ms/pergunta) e eficiência de kernel, insuficiente para justificar padding/numerics; (b) KV-prefix caching valeria à pena **mesmo sendo compute-bound** (pularia os FLOPs do prefixo compartilhado), mas o export atual ignora `past_*` (ver "Itens mortos"); (c) o único ataque real é **menos FLOPs** (modelo/prompt menores) ou **mais FLOPs por watt** (EP de NPU/GPU).
+Consequências: (a) **batchar N perguntas numa passada só não reduz FLOPs** — o ganho seria só overhead de `session.run()` (~5-10ms/pergunta) e eficiência de kernel, insuficiente para justificar padding/numerics; (b) ~~KV-prefix caching valeria à pena **mesmo sendo compute-bound** (pularia os FLOPs do prefixo compartilhado), mas o export atual ignora `past_*` (ver "Itens mortos")~~ — premissa **desmentida** em seguida: o export tem KV real e o prefix-cache foi implementado na Fase 1B (ver seção do KV real); (c) o único ataque real é **menos FLOPs** (modelo/prompt menores) ou **mais FLOPs por watt** (EP de NPU/GPU).
 
 **2. O colapso sob carga sustentada é do SoC, provado fora do runtime.** Stress de CPU puro (matmul numpy, sem qwen-serve):
 
@@ -173,7 +190,7 @@ O runtime cai de ~262ms → ~1100ms (0.24×) — o mesmo fator. É o envelope de
    - Windows/ARM (Snapdragon X): `dml` (Adreno GPU) ou `qnn` (Hexagon NPU) no `ort`;
    - macOS: `coreml` (Neural Engine);
    - Risco: suporte a `MatMulNBits` (Q4) por EP; precisa de flag `--ep` com fallback para CPU.
-   - **Implementado em 2026-09-28** (opt-in): build com `--features ep-directml|ep-coreml|ep-nnapi|ep-qnn`, runtime `--ep auto|dml|coreml|nnapi|qnn`. `auto` cai para CPU em silêncio; nome explícito falha alto. Default continua `cpu` (numéricos bit-idênticos).
+   - **Implementado em 2026-09-28** (opt-in): build com `--features ep-directml|ep-coreml|ep-nnapi|ep-qnn`, runtime `--ep auto|dml|coreml|nnapi|qnn`. `auto` cai para CPU em silêncio; nome explícito falha alto. Default continua `cpu` (numéricos bit-idênticos). *(⚠️ depois removido — ver nota ao final da seção)*
    - **Medido no Snapdragon X (Adreno, `--ep dml`)**: o DML registra e leva os matmuls + `lm_head` para a GPU, MAS os ops internos do GDN (sigmoid/decay/k_flatten/q_flatten/split) são forçados de volta ao CPU pela heurística do ORT ("CPU path is deemed faster") — o grafo ping-ponga CPU↔GPU com `MemcpyToHost/FromHost` **em todas as 24 camadas** (~120 cópias por prefill). Efeito líquido medido (123 tokens, 1 worker):
 
      | condição | CPU (12 threads) | DML (Adreno) |
@@ -255,7 +272,7 @@ Otimizações aplicadas (2026-09-28):
 
 Efeito medido (runs `36468080454` frio → `36468815911` cache quente): "Build in Alpine" **2m58s/2m08s → 63s/55s** (x64/arm64), jobs musl totais **3m50s/2m50s → 2m08s/1m57s**, `brew install` darwin-x64 41s → 24s. Wall total do run: 4m26s → 4m38s (estável — agora definido pelo `darwin-x64`: build 96s + brew 24s + modelo + smokes em série).
 
-**Fase extra (2026-09-28 tarde): EP de aceleração opt-in.** Os jobs `win32-*` agora compilam com `ep-directml` e `darwin-*` com `ep-coreml`, mais um smoke `--ep auto --cases 2` em ambas (prova o caminho acelerado com fallback silencioso em runner sem GPU). Ver detalhes e medições na seção de profundidade.
+**Fase extra (2026-09-28 tarde, executada e revertida no mesmo dia): EP de aceleração opt-in.** Chegou a existir: jobs `win32-*` com `ep-directml`, `darwin-*` com `ep-coreml` e smoke `--ep auto`. **Removida após o KV real** (EPs ficaram mais lentos que o CPU; ver ⚠️ na seção de profundidade) — o workflow voltou ao build unitário por plataforma; os números das tabelas de CI acima refletem o estado histórico em que foram medidos.
 
 ---
 
@@ -279,7 +296,7 @@ Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de inic
 ## 5. O que falta fazer (Fases do Roadmap)
 
 ### 📌 Fase 1: Otimizações de Throughput e Concorrência ✅ (implementada — 2026-09-28)
-Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPool ✅, threads/ORT tuning ✅, prompt enxuto+reordenado ✅, cache exato ✅, bench no CI ✅, KV-prefix ❌ descartado com prova. Commits: `2a8bb84` (pool+bench), `01ec6f5` (tuning+cache exato+bench no CI), `86f9fbe` (veredito KV + prompt reordenado).
+Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPool ✅, threads/ORT tuning ✅, prompt enxuto+reordenado ✅, cache exato ✅, bench no CI ✅, ~~KV-prefix ❌ descartado com prova~~ → **KV-prefix ✅ na Fase 1B** (a antiga "prova" era falsa-negativa: o export tem KV real — ver seção do KV real; implementado em `48c1121`). Commits: `2a8bb84` (pool+bench), `01ec6f5` (tuning+cache exato+bench no CI), `86f9fbe` (veredito KV + prompt reordenado).
 
 ### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
 Receita a replicar: **LoRA no `Qwen/Qwen3.5-0.8B` base** (como o `kirp/jpt-0.8b`), temperatura calibrada **T=1.140** (já é nosso default — não mudar no meio do treino).
@@ -292,7 +309,7 @@ Receita a replicar: **LoRA no `Qwen/Qwen3.5-0.8B` base** (como o `kirp/jpt-0.8b`
    * Avaliação: JevBench/Decision Index contra o JPT-0.8B (0.736 / 19.22) e contra o Laya.
 3. **Conversão e Publicação do Modelo v1.1.0**:
    * Merge do LoRA → exportação ONNX → quant Q4 (`embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx`).
-   * **Atenção**: o export atual é prefill-only (ignora `past_*` — veredito §3.6). Se o pipeline de export permitir, expor KV incremental real reabriria o prefix caching.
+   * ~~**Atenção**: o export atual é prefill-only (ignora `past_*` — veredito §3.6). Se o pipeline de export permitir, expor KV incremental real reabriria o prefix caching.~~ — **resolvido na Fase 1B**: o export já expunha KV incremental real e o prefix caching está implementado (ver seção do KV real).
    * Empacotamento do novo `.model` e publicação na Release `v1.1.0` do GitHub.
    * Reavaliação no quick-check + bench (CI já mede miss vs hit separados — avaliar o modelo novo com `--cache-size 0`).
 
