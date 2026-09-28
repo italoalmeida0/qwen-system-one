@@ -108,14 +108,18 @@ Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de inic
 
 ### 📌 Fase 1: Otimizações de Throughput e Concorrência ✅ (implementada — 2026-09-28)
 1. **Pool de Sessões Concorrentes (`SessionPool` em `main.rs`)** ✅:
-   * Pool com $N$ pares embed+decoder (`Worker`), configurável via CLI `--workers` (default `min(cpus, 4)`).
+   * Pool com $N$ pares embed+decoder (`Worker`), configurável via CLI `--workers` (default **1**: um worker gordo com todos os cores — medido como ótimo, decoder escala ~linear com threads).
    * Distribuição round-robin via `AtomicUsize`; requisições excedentes aguardam no `Mutex` do worker dentro de `spawn_blocking` (sem spin, sem deadlock).
 2. **Distribuição Equilibrada de Threads (`intra_op_threads`)** ✅:
-   * `--threads` por worker (default `cpus / workers`), total ORT ≈ núcleos físicos. `/health` reporta `workers` e `threads_per_session`.
-3. **Prefix Caching para Perguntas e Regras** ⏳ (próximo passo da Fase 1):
-   * Caching de estados de tensores KV para prefixos de prompts repetidos (ex: políticas de reembolso, regras de triagem), derrubando a latência do prefill para **< 50ms**.
-4. **Ferramenta de Benchmark de Concorrência (`tools/bench-concurrent.js`)** ✅:
-   * Rajadas concorrentes (concorrência 1, 2, 4, 8 configurável) com warmup, p50/p95 e taxa de sucesso. Validado localmente: 8/8 OK em todos os níveis, pico 1.46 req/s em build debug (release será mais rápido).
+   * `--threads` por worker (default `cpus / workers`). ORT tuning: `inter_threads=1`, `memory_pattern` off, intra/inter spinning off (SoCs móveis), tokio `worker_threads=2`. `/health` reporta `workers`, `threads_per_session` e stats de cache.
+3. **Cache exato prompt→resposta (LRU + TTL)** ✅:
+   * Ideia portada do projeto de referência `call_me_maybe`: request byte-idêntico replaya a resposta em ~1-2ms, zero FLOPs. Correto porque a engine é função pura (argmax determinístico, sem amostragem). Validado: ~1000 req/s em cache-hit nas 8 plataformas do CI.
+4. **Prefix Caching KV** ❌ (investigado e descartado neste export — 2026-09-28):
+   * Implementado e testado com gate de corretude (`--kv-check`): `max|logits_cached − logits_full| ≈ 13` (deveria ser ~1e-3).
+   * Teste dos zeros (`--kv-zero-past`): replayar zeros no lugar dos `present_*` **não muda os logits** → o `decoder_model_merged_q4.onnx` **ignora os inputs `past_*`** (export prefill-only, sem `past_sequence_length` como input).
+   * Prompt foi reordenado mesmo assim (template idêntico primeiro, state variável depois — mesma acurácia 10/10 no quick-check), deixando a porta aberta caso um futuro export exponha KV incremental de verdade.
+5. **Ferramenta de Benchmark de Concorrência (`tools/bench-concurrent.js`)** ✅:
+   * Rajadas concorrentes + fase cache-hit + stats de cache. CI roda o bench nas 8 plataformas. Medido: pico local 4.3 req/s (máquina fresca, 12 cores); CI ~1.6 req/s miss / ~1000 req/s hit.
 
 ### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
 1. **Dataset de Treinamento**:
