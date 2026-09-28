@@ -182,6 +182,24 @@ O runtime cai de ~262ms → ~1100ms (0.24×) — o mesmo fator. É o envelope de
      | sustentado (mediana) | ~900-1140ms (colapso térmico) | **~770-910ms (flat, sem colapso)** |
 
      GPU entrega ~20-25% sob carga contínua **e** previsibilidade (sem abismo térmico); CPU ainda vence de longe em rajada fria. A partição CPU/GPU do GDN é o que segura o ganho — próximos passos: `with_dimension_override` (shapes estáticos podem reduzir os fallbacks de Gather), QNN no Hexagon (partição pode ser melhor), ou exportar os ops GDN como um fused op aceito pela GPU. Lembrete: EP acelerado muda os últimos decimais dos logits (kernels fundidos) — manter `--ep cpu` nos benchmarks de paridade.
+
+### ❌ QNN/Hexagon testado de ponta a ponta — não vence (2026-09-28, curiosidade)
+
+Teste completo do EP QNN no Snapdragon X (Hexagon NPU): `--features ep-qnn` + link dinâmico contra o `onnxruntime.dll` do NuGet `Microsoft.ML.OnnxRuntime.QNN` 1.24.4 (API 24; os pré-built padrão do `ort` não trazem o EP QNN) + runtime QNN ao lado do exe (`QnnHtp.dll`, stubs/skel V73 e V81). Descobertas estruturais:
+
+* o **export OPT atual não carrega em builds stock do ORT** — `com.microsoft:CausalConvWithState` é um fused-op custom do Qwen3.5. Para testar QNN foi preciso o export padrão (`onnx-community/Qwen3.5-0.8B-ONNX`, ops primitivos; mesmo I/O, mas sem `num_logits_to_keep` e conv-cache 4-wide). O runtime ganhou **compat dual-export** (shapes dos `past_*` e offset de logits derivados do próprio grafo);
+* `QNNExecutionProvider` registra nas duas sessões e roda ponta a ponta (respostas corretas) — mas o ganho é **zero mensurável** em todos os formatos testados (123 tokens, 1 worker, mediana de 10 requests):
+
+| config | frio | sustentado (mediana) |
+|---|---|---|
+| std q4 + CPU | 958ms | 2428ms |
+| std q4 + **QNN** | 2143ms | **2378ms** (≈ empate com CPU) |
+| QDQ int8 + CPU | 3283ms | 5180ms |
+| QDQ int8 + **QNN** | 4760ms | **5262ms** (≈ empate com CPU) |
+| *(referência: OPT fundido + CPU)* | *230ms* | *1100ms* |
+| *(referência: OPT fundido + DML)* | *1800ms* | *862ms* |
+
+Leituras: (a) QNN e CPU empatam em todos os formatos → o NPU só pega sobras do grafo híbrido (GDN/conv/If) e o overhead de RPC do FastRPC come qualquer ganho; (b) o export **int8 QDQ** (formato preferido do HTP) é o MAIS LENTO de todos — 2× pior que q4 MatMulNBits em CPU; (c) nenhuma configuração QNN chega perto do OPT fundido (230ms/1100ms). Conclusão: **o caminho do NPU não vence com o modelo atual**; valeria só com um re-export dedicado QNN (fused ops decompostos + quantização HTP-friendly + shapes estáticos), que é trabalho de export, não de runtime. O ranking atual continua: **OPT fundido + CPU (rajada) e OPT fundido + DML (sustentado)**.
 2. **Export com KV real** (reabre prefix-cache: K perguntas = 1 prefill do state + K templates; ~2× em request multi-pergunta). Contrato continua igual — só o export muda.
 3. **Fase 2 (distilação/quant de ativações)**: menos params/FLOPs é a única forma de baixar latência em CPU.
 4. **Redução de tokens do prompt** (10-25%) se/ quando o contrato puder mudar — hoje 114 tokens ≈ 230ms frio.
