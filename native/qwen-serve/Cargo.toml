@@ -44,17 +44,10 @@ default = ["ort/std", "ort/ndarray", "ort/tracing", "ort/download-binaries", "or
 # mac-x64: links dynamically against modern onnxruntime from Homebrew (API 27+)
 mac-x64 = ["ort/std", "ort/ndarray", "ort/tracing", "ort/copy-dylibs", "ort/api-27", "ort/tls-native"]
 mac-x64-legacy = ["ort/std", "ort/ndarray", "ort/tracing", "ort/copy-dylibs", "ort/api-23", "ort/tls-native"]
-# Acceleration EPs (opt-in). The default build is CPU-only so numerics stay
-# bit-identical to the pinned reference outputs. Enable one or more of these
-# at BUILD time and pick one at RUN time with --ep auto|dml|coreml|nnapi|qnn.
-# ort-sys features are pure markers: the registration symbols come from the
-# onnxruntime build itself and an unavailable EP fails registration at
-# session creation (silent CPU fallback for --ep auto, hard error for an
-# explicit --ep name).
-ep-directml = ["ort/directml"]
-ep-coreml = ["ort/coreml"]
-ep-nnapi = ["ort/nnapi"]
-ep-qnn = ["ort/qnn"]
+# Execution providers (DML/CoreML/NNAPI/QNN) were implemented, measured and
+# removed on 2026-09-28: with the real KV cache the CPU path beats every
+# accelerator on target hardware (129ms sustained, no thermal collapse).
+# History: commit 32498d4; measurements in ROADMAP.
 
 [build-dependencies]
 cc = "1"
