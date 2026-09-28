@@ -56,6 +56,15 @@ cargo run --release --manifest-path native/qwen-serve/Cargo.toml -- --port 8093 
 > on an 8-core box saturates the CPU without oversubscription. `/health` reports the active
 > `workers` / `threads_per_session` configuration.
 
+### Real KV cache (`--prefix-cache`, on by default)
+
+Prompts are prefilled in chunks: the template prefix (identical for every request with the
+same question def) runs once and its `present_*` states (conv/recurrent/KV) are cached;
+later requests only prefill the state suffix. Measured on Snapdragon X: sustained latency
+**129ms median vs ~1100ms** single-pass (~8.5×), with identical decisions and displayed
+probabilities (validated case-by-case). `--prefix-cache off` restores the exact single-pass
+path (bit-identical logits to the pinned reference; chunked logits differ by ~2e-5).
+
 ### Hardware acceleration (opt-in, `--ep`)
 
 The default build and the default `--ep cpu` keep today's CPU numerics exactly (the decision

@@ -201,6 +201,7 @@ Teste completo do EP QNN no Snapdragon X (Hexagon NPU): `--features ep-qnn` + li
 
 Leituras: (a) QNN e CPU empatam em todos os formatos → o NPU só pega sobras do grafo híbrido (GDN/conv/If) e o overhead de RPC do FastRPC come qualquer ganho; (b) o export **int8 QDQ** (formato preferido do HTP) é o MAIS LENTO de todos — 2× pior que q4 MatMulNBits em CPU; (c) nenhuma configuração QNN chega perto do OPT fundido (230ms/1100ms). Conclusão: **o caminho do NPU não vence com o modelo atual**; valeria só com um re-export dedicado QNN (fused ops decompostos + quantização HTP-friendly + shapes estáticos), que é trabalho de export, não de runtime. O ranking atual continua: **OPT fundido + CPU (rajada) e OPT fundido + DML (sustentado)**.
 2. **Export com KV real** (reabre prefix-cache: K perguntas = 1 prefill do state + K templates; ~2× em request multi-pergunta). Contrato continua igual — só o export muda.
+   - **Feito como runtime em 2026-09-28** (melhor que o esperado): o export OPT **já tem** past_*/present_* funcionais — o oráculo provou que prefill em chunks (chunk1 → present_* → chunk2) ≡ single-pass com `max|d|=2.2e-5` (ruído fp) na convenção `a` (position_ids absolutos nas 3 linhas). Implementado como **chunked prefill + cache de prefixo do template** (`--prefix-cache on|off`, default on; off = single-pass bit-idêntico). Ver seção própria abaixo.
 3. **Fase 2 (distilação/quant de ativações)**: menos params/FLOPs é a única forma de baixar latência em CPU.
 4. **Redução de tokens do prompt** (10-25%) se/ quando o contrato puder mudar — hoje 114 tokens ≈ 230ms frio.
 5. **Micro-batching entre requests concorrentes** (só para throughput, não latência): hoje c=2/4 apenas enfileira (mesmo ~1 req/s); batch de verdade exigiria batch-dim dinâmico + scheduler.
@@ -209,6 +210,26 @@ Leituras: (a) QNN e CPU empatam em todos os formatos → o NPU só pega sobras d
 * Modelo base empacotado em `models/qwen-0.8b-q4.model` (533 MB).
 * Publicado como release asset no GitHub: [Release v1.0.0](https://github.com/italoalmeida0/qwen-system-one/releases/tag/v1.0.0).
 * Script de aquisição e extração com verificação SHA256 implementado (`tools/acquire-model.js`).
+
+### ✅ KV real: chunked prefill + cache de prefixo do template (2026-09-28, Fase 1B)
+
+A premissa antiga ("o export ignora `past_*`, prefix-cache exige re-export") estava **errada** — provada errada por oráculo numérico (`kv-oracle.py`): dividir o prefill em chunks e passar `present_*` → `past_*` reproduz o single-pass com `max|d|=2.2e-5` (2.2e-5 = ruído de ponto flutuante). A convenção vencedora testada contra o output single-pass real: **position_ids absolutos (`P..P+S`) nas 3 linhas** + `attention_mask` sobre o comprimento TOTAL; qualquer split da sequência de ids é correto (basta chunk1+chunk2 == full).
+
+Implementado no runtime (`native/qwen-serve`): o prompt é dividido em **prefixo do template** (idêntico entre requests com a mesma pergunta) + sufixo (state + cauda). O prefixo roda UMA vez e seus `present_*` (conv/recurrent/KV reais) ficam num cache global (16 entradas, chave = ids do prefixo — determinístico por qdef via LCP de tokens); requests seguintes preenchem só o sufixo. `--prefix-cache off` restaura o single-pass bit-idêntico.
+
+**Paridade validada** (quick-check, 10 casos EN/PT/ES + multi-pergunta): decisões E probabilidades exibidas **idênticas** com cache on vs off (o único "mismatch" do caso 9 é comportamento pré-existente do modelo — os dois modos concordam).
+
+**Ganho medido (local, 1 worker × 12 threads, prompt ~114-123 tokens, template 86):**
+
+| cenário | antes (single-pass) | depois (KV real) |
+|---|---|---|
+| miss (primeiro request do qdef) | ~230ms frio / ~900ms quente | 466ms (2 runs: template + sufixo) |
+| **hit (requests seguintes, sustentado)** | **~850-1100ms** (colapso térmico) | **109-129ms** (mediana 129ms) |
+| quick-check (10 casos + multi) | avg 515-770ms | **avg 301ms** (3.3 req/s) |
+| multi-pergunta (3 qdefs, 1º request) | 2668ms | 2036ms (1 hit + 2 miss) |
+| multi-pergunta (3 qdefs, aquecido) | ~2600ms | **~350-400ms** |
+
+~8.5× no sustentado e **sem abismo térmico** (37 tokens de sufixo mal aquecem o SoC). Observações: o `embed` ainda roda a sequência inteira (barato, ~2-3%); o cache guarda `DynValue`s compartilhados entre workers (Arc clones, zero cópia); e o sufixo do state não é cacheável no formato atual (ordem template→state no prompt — reordenar para state→template habilitaria cache do state entre perguntas do MESMO request, ~2× em multi, mas muda o prompt-contract).
 
 ### ✅ CI — tempos por job e o que foi otimizado (2026-09-28)
 

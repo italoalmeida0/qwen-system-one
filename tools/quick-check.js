@@ -27,6 +27,7 @@ const port = parseInt(val('port', '8093'), 10);
 // --cases N truncates the case list (for slow EP smoke runs on software adapters).
 const ep = val('ep', null);
 const maxCases = parseInt(val('cases', '0'), 10);
+const prefixCache = val('prefix-cache', null);
 
 let explicitBinary = val('binary', null);
 if (!explicitBinary) {
@@ -93,7 +94,9 @@ async function main() {
   console.log(`[quick-check] models: ${modelDir}`);
   console.log(`[quick-check] port  : ${port}`);
 
-  const child = spawn(binPath, ['--model-dir', modelDir, '--port', String(port), '--host', '127.0.0.1', ...(ep ? ['--ep', ep] : [])], {
+  const child = spawn(binPath, ['--model-dir', modelDir, '--port', String(port), '--host', '127.0.0.1',
+    ...(ep ? ['--ep', ep] : []),
+    ...(prefixCache ? ['--prefix-cache', prefixCache] : [])], {
     stdio: ['ignore', 'inherit', 'inherit']
   });
 
