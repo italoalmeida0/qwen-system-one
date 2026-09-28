@@ -19,6 +19,11 @@ pub const LABEL_TOKEN_IDS: &[i64] = &[
 
 pub struct RenderedQuestion {
     pub prompt: String,
+    /// Template-only prefix of `prompt` ("{template}\n\n"). Identical across
+    /// requests with the same question def, which makes it cacheable: its
+    /// present_* states (conv/recurrent/KV) can seed the suffix chunk instead
+    /// of re-running the template tokens every request.
+    pub split_prompt: String,
     pub keys: Vec<String>,
     pub label_token_ids: Vec<i64>,
 }
@@ -190,11 +195,13 @@ pub fn render_question(state: &Value, qdef: &QDef) -> Result<RenderedQuestion, S
     let prompt = format!(
         "{template}{state_part}<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer:",
     );
+    let split_prompt = format!("{template}\n\n");
 
     let label_token_ids = LABEL_TOKEN_IDS[..k].to_vec();
 
     Ok(RenderedQuestion {
         prompt,
+        split_prompt,
         keys,
         label_token_ids,
     })

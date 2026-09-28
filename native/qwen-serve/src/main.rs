@@ -61,6 +61,13 @@ struct Args {
     /// ep-nnapi, ep-qnn); the default build is CPU-only.
     #[arg(long, default_value = "cpu")]
     ep: String,
+    /// Chunked prefill + template prefix cache ("KV real"): caches the
+    /// present_* states of the template chunk and reuses them on later
+    /// requests with the same question def, so only the state suffix is
+    /// re-prefilled. "off" restores the exact single-pass path (bit-identical
+    /// logits to the pinned reference; chunked logits differ by ~2e-5).
+    #[arg(long, value_name = "on|off", default_value = "on")]
+    prefix_cache: String,
     /// Temperature for softmax (default 1.140 for Qwen 3.5 / JPT)
     #[arg(long, default_value_t = 1.140)]
     temperature: f32,
@@ -151,6 +158,12 @@ struct AppState {
     /// Decoder accepts `num_logits_to_keep` (the OPT fused-op export does;
     /// the standard primitive-op export computes logits for every position).
     num_logits_input: bool,
+    /// Chunked-prefill prefix cache: template-token prefix -> the matching
+    /// past_* inputs (the template chunk's present_* outputs), keyed by the
+    /// prefix ids themselves. Bounded (cleared on overflow); shared by all
+    /// workers — the states are plain tensors, safe for any decoder session.
+    prefix_cache: std::sync::Mutex<std::collections::HashMap<Vec<i64>, Vec<(&'static str, DynValue)>>>,
+    prefix_cache_on: bool,
     temperature: f32,
     api_key: Option<String>,
     workers_count: usize,
@@ -223,6 +236,40 @@ fn ep_dispatch(ep_arg: &str) -> anyhow::Result<Vec<ort::ep::ExecutionProviderDis
         ));
     }
     Ok(out)
+}
+
+/// present_* output name matching a past_* input name. Validated on the
+/// merged decoder graph (kv-oracle): past_key_values.N -> present.N,
+/// past_conv.N -> present_conv.N, past_recurrent.N -> present_recurrent.N.
+fn present_name(past: &str) -> String {
+    if let Some(rest) = past.strip_prefix("past_key_values.") {
+        format!("present.{rest}")
+    } else if let Some(rest) = past.strip_prefix("past_conv.") {
+        format!("present_conv.{rest}")
+    } else if let Some(rest) = past.strip_prefix("past_recurrent.") {
+        format!("present_recurrent.{rest}")
+    } else {
+        format!("present.{past}")
+    }
+}
+
+/// Split point for chunked prefill: the token prefix of `token_ids` shared
+/// with `split_prompt` (the template-only string). The divergence point
+/// depends only on fixed template strings, so the split is deterministic per
+/// question def and the prefix-cache key stays stable across states. None
+/// when chunking does not apply (empty/too-short split).
+fn prefix_split_len(tokenizer: &Tokenizer, split_prompt: &str, token_ids: &[i64]) -> Option<usize> {
+    let enc = tokenizer.encode(split_prompt, false).ok()?;
+    let prefix_ids = enc.get_ids();
+    let mut p = 0usize;
+    while p < prefix_ids.len() && p + 1 < token_ids.len() && token_ids[p] == prefix_ids[p] as i64 {
+        p += 1;
+    }
+    if p >= 1 {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 // Trimmed runtimes: tokio multi_thread with exactly 2 core threads
@@ -369,6 +416,8 @@ async fn main() -> anyhow::Result<()> {
         tokenizer,
         precreated_past,
         num_logits_input,
+        prefix_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        prefix_cache_on: args.prefix_cache.trim().to_ascii_lowercase() != "off",
         temperature: args.temperature,
         api_key,
         workers_count,
@@ -512,7 +561,21 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
         let seq_len = token_ids.len();
         total_in += seq_len;
 
-        // 1. Run embed session
+        // Chunked-prefill split (prefix cache): the template tokens are
+        // identical across requests with the same qdef, so their present_*
+        // states can be cached and the suffix chunk reuses them instead of
+        // re-prefilling the whole prompt. Oracle-validated (chunked ==
+        // single-pass within 2.2e-5): position_ids absolute on all 3 rows,
+        // attention_mask over the full length. Splitting the id sequence at
+        // ANY point is correct; the cache key is the prefix ids themselves.
+        let split_at: Option<usize> = if st.prefix_cache_on {
+            prefix_split_len(&st.tokenizer, &rendered.split_prompt, &token_ids)
+        } else {
+            None
+        };
+        let cache_key = split_at.map(|p| token_ids[..p].to_vec());
+
+        // 1. Run embed session (full id sequence once; rows sliced per chunk)
         let t_embed_start = std::time::Instant::now();
         let t_ids = Tensor::from_array((vec![1, seq_len], token_ids.into_boxed_slice()))
             .map_err(|e| err500("input_ids", format_args!("{e:?}")))?;
@@ -531,20 +594,47 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
 
         // 2. Prepare decoder inputs
         let t_prep_start = std::time::Instant::now();
-        let t_embeds = Tensor::from_array((vec![1, seq_len, 1024], embed_data.into_boxed_slice()))
-            .map_err(|e| err500("embed_tensor", format_args!("{e:?}")))?;
-
-        let t_attn = Tensor::from_array((vec![1, seq_len], vec![1i64; seq_len].into_boxed_slice()))
-            .map_err(|e| err500("attn_tensor", format_args!("{e:?}")))?;
-
-        let mut pos_ids = Vec::with_capacity(3 * seq_len);
-        for _ in 0..3 {
-            for i in 0..seq_len {
-                pos_ids.push(i as i64);
+        let (t_embeds, t_attn, t_pos) = match split_at {
+            // Suffix chunk: embedding rows p..seq_len, attention over the FULL
+            // length (cached template positions stay visible), absolute
+            // positions p..seq_len on all 3 rows (oracle convention 'a').
+            Some(p) => {
+                let s = seq_len - p;
+                let e = embed_data[p * 1024..].to_vec();
+                let t_embeds = Tensor::from_array((vec![1, s, 1024], e.into_boxed_slice()))
+                    .map_err(|e| err500("embed_tensor", format_args!("{e:?}")))?;
+                let t_attn =
+                    Tensor::from_array((vec![1, seq_len], vec![1i64; seq_len].into_boxed_slice()))
+                        .map_err(|e| err500("attn_tensor", format_args!("{e:?}")))?;
+                let mut pos_ids = Vec::with_capacity(3 * s);
+                for _ in 0..3 {
+                    for i in p..seq_len {
+                        pos_ids.push(i as i64);
+                    }
+                }
+                let t_pos = Tensor::from_array((vec![3, 1, s], pos_ids.into_boxed_slice()))
+                    .map_err(|e| err500("pos_tensor", format_args!("{e:?}")))?;
+                (t_embeds, t_attn, t_pos)
             }
-        }
-        let t_pos = Tensor::from_array((vec![3, 1, seq_len], pos_ids.into_boxed_slice()))
-            .map_err(|e| err500("pos_tensor", format_args!("{e:?}")))?;
+            None => {
+                let t_embeds = Tensor::from_array((vec![1, seq_len, 1024], embed_data.clone().into_boxed_slice()))
+                    .map_err(|e| err500("embed_tensor", format_args!("{e:?}")))?;
+
+                let t_attn =
+                    Tensor::from_array((vec![1, seq_len], vec![1i64; seq_len].into_boxed_slice()))
+                        .map_err(|e| err500("attn_tensor", format_args!("{e:?}")))?;
+
+                let mut pos_ids = Vec::with_capacity(3 * seq_len);
+                for _ in 0..3 {
+                    for i in 0..seq_len {
+                        pos_ids.push(i as i64);
+                    }
+                }
+                let t_pos = Tensor::from_array((vec![3, 1, seq_len], pos_ids.into_boxed_slice()))
+                    .map_err(|e| err500("pos_tensor", format_args!("{e:?}")))?;
+                (t_embeds, t_attn, t_pos)
+            }
+        };
 
         let mut inputs: Vec<(&str, DynValue)> = Vec::with_capacity(55);
         inputs.push(("inputs_embeds", DynValue::from(t_embeds)));
@@ -557,16 +647,80 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
             inputs.push(("num_logits_to_keep", DynValue::from(t_num_logits)));
         }
 
-        // 3. Reuse pre-created past state tensors (zero cost Arc clones)
-        for (name, val) in &st.precreated_past {
-            inputs.push((*name, val.clone()));
-        }
         let t_prep_dur = t_prep_start.elapsed();
 
         // 4. Run decoder session
         let t_dec_start = std::time::Instant::now();
-        let target_logits: Vec<f32> = {
+        let (target_logits, run_desc): (Vec<f32>, String) = {
             let mut decoder_session = st.workers[worker_idx].decoder.lock().unwrap();
+
+            // 3. Past states: cached template-chunk presents when chunking
+            // (KV real), pre-created zeros for the single-pass path.
+            let (pasts, run_desc) = match (split_at, cache_key) {
+                (Some(p), Some(key)) => {
+                    let hit = st.prefix_cache.lock().unwrap().get(&key).cloned();
+                    match hit {
+                        Some(cached) => (cached, format!("{p}/{seq_len} hit")),
+                        None => {
+                            // Cache miss: prefill the template chunk alone and
+                            // keep its present_* states as the past inputs.
+                            let e1 = embed_data[..p * 1024].to_vec();
+                            let t_e1 = Tensor::from_array((vec![1, p, 1024], e1.into_boxed_slice()))
+                                .map_err(|e| err500("embed_tensor", format_args!("{e:?}")))?;
+                            let t_a1 =
+                                Tensor::from_array((vec![1, p], vec![1i64; p].into_boxed_slice()))
+                                    .map_err(|e| err500("attn_tensor", format_args!("{e:?}")))?;
+                            let mut pos1 = Vec::with_capacity(3 * p);
+                            for _ in 0..3 {
+                                for i in 0..p {
+                                    pos1.push(i as i64);
+                                }
+                            }
+                            let t_p1 = Tensor::from_array((vec![3, 1, p], pos1.into_boxed_slice()))
+                                .map_err(|e| err500("pos_tensor", format_args!("{e:?}")))?;
+                            let mut in1: Vec<(&str, DynValue)> = Vec::with_capacity(55);
+                            in1.push(("inputs_embeds", DynValue::from(t_e1)));
+                            in1.push(("attention_mask", DynValue::from(t_a1)));
+                            in1.push(("position_ids", DynValue::from(t_p1)));
+                            if st.num_logits_input {
+                                let t_n1 = Tensor::from_array((
+                                    Vec::<usize>::new(),
+                                    vec![1i64].into_boxed_slice(),
+                                ))
+                                .map_err(|e| err500("num_logits_tensor", format_args!("{e:?}")))?;
+                                in1.push(("num_logits_to_keep", DynValue::from(t_n1)));
+                            }
+                            for (name, val) in &st.precreated_past {
+                                in1.push((*name, val.clone()));
+                            }
+                            let out1 = decoder_session
+                                .run(in1)
+                                .map_err(|e| err500("decoder_run_prefix", format_args!("{e:?}")))?;
+                            let mut cached: Vec<(&'static str, DynValue)> =
+                                Vec::with_capacity(st.precreated_past.len());
+                            for (name, _) in &st.precreated_past {
+                                let pn = present_name(name);
+                                let pv = out1.get(&pn).ok_or_else(|| {
+                                    err500("prefix_present_missing", format_args!("{pn}"))
+                                })?;
+                                cached.push((*name, pv.clone()));
+                            }
+                            {
+                                let mut cache = st.prefix_cache.lock().unwrap();
+                                if cache.len() >= 16 {
+                                    cache.clear();
+                                }
+                                cache.insert(key, cached.clone());
+                            }
+                            (cached, format!("{p}/{seq_len} miss"))
+                        }
+                    }
+                }
+                _ => (st.precreated_past.clone(), format!("{seq_len} full")),
+            };
+            for (name, val) in &pasts {
+                inputs.push((*name, val.clone()));
+            }
             let decoder_out = decoder_session
                 .run(inputs)
                 .map_err(|e| err500("decoder_run", format_args!("{e:?}")))?;
@@ -593,13 +747,13 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
                 let logit = logits_data.get(idx).copied().unwrap_or(f32::NEG_INFINITY);
                 targets.push(logit);
             }
-            targets
+            (targets, run_desc)
         };
         let t_dec_dur = t_dec_start.elapsed();
         let t_total = t_start.elapsed();
 
         eprintln!(
-            "[w{worker_idx}:{qid}] total={:?} (embed={:?}, prep={:?}, decoder={:?}, tokens={seq_len})",
+            "[w{worker_idx}:{qid}] total={:?} (embed={:?}, prep={:?}, decoder={:?}, tokens={seq_len}, chunk={run_desc})",
             t_total, t_embed_dur, t_prep_dur, t_dec_dur
         );
 
