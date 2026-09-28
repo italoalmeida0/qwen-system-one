@@ -74,22 +74,47 @@ def main():
             print(f"SKIP {locale}: {f} não encontrado")
             continue
         df = pd.read_parquet(f)
-        # colunas MINDS-14: intent, transcription/lang_transcription
-        text_col = next((c for c in df.columns if "transcription" in c.lower()), None)
+        # Schema real MINDS-14 (verificado via datasets-server):
+        #   transcription (str, idioma local), english_transcription (str),
+        #   intent_class (int 0..N-1), path, audio, lang_id.
+        # NÃO existe coluna 'intent' string — os nomes vêm do metadata do parquet.
+        text_col = "transcription" if "transcription" in df.columns else next(
+            (c for c in df.columns if "transcription" in c.lower()), None
+        )
         if text_col is None:
             print(f"SKIP {locale}: sem coluna de texto {list(df.columns)}")
             continue
-        by_intent = defaultdict(list)
+        int_col = "intent_class" if "intent_class" in df.columns else next(
+            (c for c in df.columns if "intent" in c.lower()), None
+        )
+        if int_col is None:
+            print(f"SKIP {locale}: sem coluna de intent {list(df.columns)}")
+            continue
+        # Nomes das classes: metadata do parquet (arrow schema) ou fallback.
+        try:
+            import pyarrow.parquet as pq
+
+            schema = pq.read_schema(f)
+            field = schema.field(int_col)
+            intents = list(field.type.names) if hasattr(field.type, "names") else None
+        except Exception:
+            intents = None
+        if not intents:
+            intents = [f"intent_{i}" for i in sorted(df[int_col].unique().tolist())]
+        by_idx = defaultdict(list)
         for _, r in df.iterrows():
-            by_intent[str(r["intent"])].append(str(r[text_col]))
-        intents = sorted(by_intent)
+            by_idx[int(r[int_col])].append(str(r[text_col]))
         n0 = len(out)
-        for i in range(0, len(intents), args.max_options):
-            opts = intents[i : i + args.max_options]
-            for intent in opts:
-                pool = by_intent[intent]
+        idxs = list(range(len(intents)))
+        for i in range(0, len(idxs), args.max_options):
+            grp = idxs[i : i + args.max_options]
+            opts = [intents[j] for j in grp]
+            for j in grp:
+                pool = by_idx.get(j, [])
+                if not pool:
+                    continue
                 for utt in random.sample(pool, min(args.per_intent, len(pool))):
-                    out.append(to_typed(utt, HEADS[locale], opts, intent))
+                    out.append(to_typed(utt, HEADS[locale], opts, intents[j]))
         print(f"{locale}: +{len(out)-n0} exemplos ({len(intents)} intents)")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
