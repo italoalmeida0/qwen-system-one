@@ -148,6 +148,9 @@ struct AppState {
     next: AtomicUsize,
     tokenizer: Tokenizer,
     precreated_past: Vec<(&'static str, DynValue)>,
+    /// Decoder accepts `num_logits_to_keep` (the OPT fused-op export does;
+    /// the standard primitive-op export computes logits for every position).
+    num_logits_input: bool,
     temperature: f32,
     api_key: Option<String>,
     workers_count: usize,
@@ -321,27 +324,39 @@ async fn main() -> anyhow::Result<()> {
     }
     // Pre-create all static past states once (shape is identical for every
     // worker, so probe the first decoder session and share the tensors).
+    // Shapes come from the graph itself: the conv cache is 3-wide in the OPT
+    // export (CausalConvWithState fused op) and 4-wide in the standard
+    // export (primitive ops), while recurrent/KV states match both.
     let mut precreated_past: Vec<(&'static str, DynValue)> = Vec::new();
+    let mut num_logits_input = false;
     {
         let first = workers[0].decoder.lock().unwrap();
         for inp in first.inputs().iter() {
             let name = inp.name().to_string();
-            if name.starts_with("past_conv") {
-                let data = vec![0.0f32; 1 * 6144 * 3];
-                let t = oe(Tensor::from_array((vec![1, 6144, 3], data.into_boxed_slice())))?;
-                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
-            } else if name.starts_with("past_recurrent") {
-                let data = vec![0.0f32; 1 * 16 * 128 * 128];
-                let t = oe(Tensor::from_array((vec![1, 16, 128, 128], data.into_boxed_slice())))?;
-                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+            if name == "num_logits_to_keep" {
+                num_logits_input = true;
             } else if name.starts_with("past_key_values") {
                 let data = vec![0.0f32; 0];
                 let t = oe(Tensor::from_array((vec![1, 2, 0, 256], data.into_boxed_slice())))?;
                 precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+            } else if name.starts_with("past_conv") || name.starts_with("past_recurrent") {
+                let dims: Vec<usize> = match inp.dtype() {
+                    ort::value::ValueType::Tensor { shape, .. } => {
+                        shape.iter().map(|&d| if d < 0 { 1 } else { d as usize }).collect()
+                    }
+                    _ => continue,
+                };
+                let n: usize = dims.iter().product();
+                let data = vec![0.0f32; n];
+                let t = oe(Tensor::from_array((dims, data.into_boxed_slice())))?;
+                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
             }
         }
     }
-    info!("pre-created {} past state tensors", precreated_past.len());
+    info!(
+        "pre-created {} past state tensors (num_logits_to_keep input: {num_logits_input})",
+        precreated_past.len()
+    );
 
     // ---- Tokenizer ----
     let tok_path = args.model_dir.join("tokenizer.json");
@@ -353,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
         next: AtomicUsize::new(0),
         tokenizer,
         precreated_past,
+        num_logits_input,
         temperature: args.temperature,
         api_key,
         workers_count,
@@ -530,14 +546,16 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
         let t_pos = Tensor::from_array((vec![3, 1, seq_len], pos_ids.into_boxed_slice()))
             .map_err(|e| err500("pos_tensor", format_args!("{e:?}")))?;
 
-        let t_num_logits = Tensor::from_array((Vec::<usize>::new(), vec![1i64].into_boxed_slice()))
-            .map_err(|e| err500("num_logits_tensor", format_args!("{e:?}")))?;
-
         let mut inputs: Vec<(&str, DynValue)> = Vec::with_capacity(55);
         inputs.push(("inputs_embeds", DynValue::from(t_embeds)));
         inputs.push(("attention_mask", DynValue::from(t_attn)));
         inputs.push(("position_ids", DynValue::from(t_pos)));
-        inputs.push(("num_logits_to_keep", DynValue::from(t_num_logits)));
+        if st.num_logits_input {
+            // OPT export: score with the last position's row only.
+            let t_num_logits = Tensor::from_array((Vec::<usize>::new(), vec![1i64].into_boxed_slice()))
+                .map_err(|e| err500("num_logits_tensor", format_args!("{e:?}")))?;
+            inputs.push(("num_logits_to_keep", DynValue::from(t_num_logits)));
+        }
 
         // 3. Reuse pre-created past state tensors (zero cost Arc clones)
         for (name, val) in &st.precreated_past {
@@ -553,13 +571,25 @@ fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody,
                 .run(inputs)
                 .map_err(|e| err500("decoder_run", format_args!("{e:?}")))?;
 
-            let (_shape, logits_data) = decoder_out["logits"]
+            let (logits_shape, logits_data) = decoder_out["logits"]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| err500("logits_extract", format_args!("{e:?}")))?;
 
+            // Row selection is export-dependent: num_logits_to_keep=1 yields a
+            // single logits row (OPT), while the standard export emits one row
+            // per position and the next-token distribution lives in the last.
+            let dims: &[i64] = logits_shape;
+            let vocab = dims.last().copied().unwrap_or(0).max(0) as usize;
+            let rows = if dims.len() >= 3 {
+                (dims[dims.len() - 2]).max(1) as usize
+            } else {
+                1
+            };
+            let row_off = (rows - 1) * vocab;
+
             let mut targets = Vec::with_capacity(rendered.label_token_ids.len());
             for &tid in &rendered.label_token_ids {
-                let idx = tid as usize;
+                let idx = row_off + tid as usize;
                 let logit = logits_data.get(idx).copied().unwrap_or(f32::NEG_INFINITY);
                 targets.push(logit);
             }
