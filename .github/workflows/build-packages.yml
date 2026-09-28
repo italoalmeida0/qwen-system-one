@@ -1,0 +1,184 @@
+name: build packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+
+concurrency:
+  group: build-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Native binaries (6 platforms)
+  # ------------------------------------------------------------------
+  binaries:
+    name: binary (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'linux-x64',   os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  out: linux-x64/qwen-serve }
+          - { name: 'linux-arm64', os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, out: linux-arm64/qwen-serve }
+          - { name: 'win32-x64',   os: windows-latest,   target: x86_64-pc-windows-msvc,    out: win32-x64/qwen-serve.exe }
+          - { name: 'win32-arm64', os: windows-11-arm,   target: aarch64-pc-windows-msvc,   out: win32-arm64/qwen-serve.exe }
+          - { name: 'darwin-arm64',os: macos-latest,     target: aarch64-apple-darwin,      out: darwin-arm64/qwen-serve }
+          - { name: 'darwin-x64',  os: macos-15-intel,   target: x86_64-apple-darwin,       out: darwin-x64/qwen-serve }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: '${{ matrix.target }}' }
+
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: native/qwen-serve }
+
+      - name: Provide ORT libs for mac-x64 (no ort-sys prebuilt)
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-osx-x86_64-1.23.0.tgz"
+          mkdir -p "$GITHUB_WORKSPACE/ort-libs"
+          tar -xzf /tmp/ort.tgz -C "$GITHUB_WORKSPACE/ort-libs" --strip-components=1
+          find "$GITHUB_WORKSPACE/ort-libs" -name 'libonnxruntime*.dylib' -exec cp {} "$GITHUB_WORKSPACE/ort-libs/" \;
+
+      - name: Build qwen-serve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            export ORT_LIB_PATH="$GITHUB_WORKSPACE/ort-libs"
+            export ORT_PREFER_DYNAMIC_LINK=1
+            cargo build --release --no-default-features --features mac-x64-legacy --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
+          else
+            cargo build --release --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
+          fi
+
+      - name: Stage into dist/bin/<slot>
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT='dist/bin/${{ matrix.out }}'
+          mkdir -p "$(dirname "$OUT")"
+          BIN="native/qwen-serve/target/${{ matrix.target }}/release/qwen-serve"
+          [[ "$OUT" == *.exe ]] && BIN="$BIN.exe"
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT" 2>/dev/null || true
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            cp ort-libs/libonnxruntime*.dylib "$(dirname "$OUT")/"
+            for dylib in "$(dirname "$OUT")"/libonnxruntime*.dylib; do
+              install_name_tool -id "@loader_path/$(basename "$dylib")" "$dylib"
+            done
+            for ref in $(otool -L "$OUT" | awk '/libonnxruntime/{print $1}'); do
+              install_name_tool -change "$ref" "@loader_path/$(basename "$ref")" "$OUT"
+            done
+          fi
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Smoke the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN='dist/bin/${{ matrix.out }}'
+          ls -la "$BIN"
+          "$BIN" --help 2>&1 | head -5
+
+      - name: Fetch the model (verified against the manifest)
+        run: node tools/acquire-model.js
+
+      - name: Prove the binary answers questions (10 questions)
+        run: node tools/quick-check.js --binary 'dist/bin/${{ matrix.out }}'
+
+      - name: Upload this platform's binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-serve-${{ matrix.name }}
+          path: dist/bin/${{ matrix.name }}
+          retention-days: 14
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Musl binaries: built inside Alpine Docker (2 platforms)
+  # ------------------------------------------------------------------
+  musl:
+    name: binary (linux-${{ matrix.arch }}-musl)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-latest,    triple: x86_64-unknown-linux-musl }
+          - { arch: arm64, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Alpine and copy the musl libs it links
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -euxc '
+            echo "https://dl-cdn.alpinelinux.org/alpine/edge/main" > /etc/apk/repositories
+            echo "https://dl-cdn.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories
+            apk add --no-cache nodejs npm build-base rust cargo pkgconf openssl-dev onnxruntime onnxruntime-dev
+            export ORT_LIB_PATH=/usr/lib
+            export ORT_PREFER_DYNAMIC_LINK=1
+            cargo build --release --manifest-path native/qwen-serve/Cargo.toml
+
+            SLOT=dist/bin/linux-${{ matrix.arch }}-musl
+            mkdir -p "$SLOT/lib"
+            cp native/qwen-serve/target/release/qwen-serve "$SLOT/qwen-serve"
+
+            apk add --no-cache curl
+            copy_deps() {
+              for so in $(ldd "$1" | awk "/=> \//{print \$3}" | sort -u); do
+                base=$(basename "$so")
+                [ -e "$SLOT/lib/$base" ] && continue
+                cp "$so" "$SLOT/lib/$base"
+                copy_deps "$so"
+              done
+            }
+            copy_deps "$SLOT/qwen-serve"
+            for so in "$SLOT"/lib/*.so.*; do
+              base=$(basename "$so"); soname=${base%%.so.*}.so
+              [ -e "$SLOT/lib/$soname" ] || ln -sf "$base" "$SLOT/lib/$soname"
+            done
+            ls "$SLOT/lib" | wc -l
+            ldd "$SLOT/qwen-serve" | head -5
+          '
+
+      - name: Take ownership of everything the container wrote as root
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist native 2>/dev/null || true
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Bundle the musl binary (self-extracting, libs inside)
+        run: node tools/make-bundle.js linux-${{ matrix.arch }}-musl
+
+      - name: Prove the bundle runs on bare Alpine (no system deps)
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 \
+            sh -c 'dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle --help | head -5'
+
+      - name: Fetch the model (verified against the manifest)
+        run: node tools/acquire-model.js
+
+      - name: Prove the bundle answers questions inside bare Alpine
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -c '
+            apk add --no-cache nodejs
+            node tools/quick-check.js --binary dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle
+          '
+
+      - name: Upload this platform's package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-serve-linux-${{ matrix.arch }}-musl
+          path: dist/bin/linux-${{ matrix.arch }}-musl/
+          retention-days: 14
+          if-no-files-found: error

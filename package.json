@@ -1,0 +1,31 @@
+{
+  "name": "qwen-system-one",
+  "version": "1.0.0",
+  "description": "Self-contained Qwen 3.5 0.8B System 1 decision engine: INT4 ONNX transformer served by a zero-dependency native Rust binary. TypeSafe Jev wire-compatible (/v1/systemone).",
+  "type": "module",
+  "scripts": {
+    "model:acquire": "node ./tools/acquire-model.js",
+    "quick:check": "node ./tools/quick-check.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/italoalmeida0/qwen-system-one.git"
+  },
+  "keywords": [
+    "qwen",
+    "system-one",
+    "decision-engine",
+    "jev",
+    "typesafe",
+    "inference",
+    "native",
+    "rust",
+    "onnx"
+  ],
+  "author": "Italo Almeida <https://github.com/italoalmeida0>",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/italoalmeida0/qwen-system-one/issues"
+  },
+  "homepage": "https://github.com/italoalmeida0/qwen-system-one#readme"
+}

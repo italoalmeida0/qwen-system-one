@@ -1,0 +1,22 @@
+# Dependencies & caches
+node_modules/
+*.log
+.env
+.cache/
+tmp/
+
+# Build artifacts
+dist/
+native/*/target/
+ort-libs/
+
+# Model files & weights (downloaded via GitHub releases / acquire-model.js)
+models/*.model
+models/*.onnx
+models/*.onnx_data
+models/tokenizer.json
+!models/model.manifest.json
+
+# OS specific
+.DS_Store
+Thumbs.db

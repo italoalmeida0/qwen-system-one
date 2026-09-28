@@ -1,0 +1,36 @@
+{
+  "$comment": "Qwen 3.5 0.8B Q4 ONNX decision model package manifest",
+  "model": "qwen-0.8b-q4.model",
+  "version": "1.0.0",
+  "modelVersion": "1.0.0",
+  "bytes": 558953443,
+  "sha256": "6bdd4735cb967bb83087c96acfde602850006a87f03aacf1d7da617b8e9432e4",
+  "files": [
+    {
+      "name": "embed_tokens_q4.onnx",
+      "bytes": 857,
+      "sha256": "8773dcf4858f855bfce13def4356ca17e0bc516a477154496b6ffb6dd6d084dc"
+    },
+    {
+      "name": "embed_tokens_q4.onnx_data",
+      "bytes": 162897920,
+      "sha256": "9210b1d26eb14136d3522584d17da14cc5f4b82b6f5607e6d80d59424a8cbe99"
+    },
+    {
+      "name": "decoder_model_merged_q4.onnx",
+      "bytes": 576621,
+      "sha256": "7390858c80a67275d8cb81fb70f66a24d3b86fe333057c1312de09c184a2d41b"
+    },
+    {
+      "name": "decoder_model_merged_q4.onnx_data",
+      "bytes": 483655680,
+      "sha256": "1a9165072dd51a9b6a917b6357a3686372b7429313022802cd4c9a730e8c9749"
+    },
+    {
+      "name": "tokenizer.json",
+      "bytes": 19989325,
+      "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    }
+  ],
+  "source": "https://github.com/italoalmeida0/qwen-system-one/releases/download/v1.0.0/qwen-0.8b-q4.model"
+}
