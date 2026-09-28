@@ -85,40 +85,56 @@ Workflow do GitHub Actions ([`.github/workflows/build-packages.yml`](file:///.gi
 
 ---
 
-## 4. O que falta fazer (Próximos Passos Prioritários)
+## 4. Estratégia de Desenvolvimento: Por que Otimizar o Runtime ANTES do Fine-Tuning?
 
-Para dar continuidade, dividimos as tarefas em duas frentes: **Treinamento** e **Otimização de Runtime**.
+Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de iniciar o treinamento/fine-tuning. Essa decisão de arquitetura baseia-se em 3 pilares:
 
-### Fase 1: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
-O modelo atual é o Qwen base não calibrado especificamente para o prompt System 1. Para torná-lo um classificador de classe mundial:
+1. **Definição do "Contrato de Prompt" Definitivo**:
+   * O tempo de decodificação e prefill na CPU depende diretamente da quantidade de tokens de entrada e da padronização dos delimitadores.
+   * Ao otimizar o *Prefix Cache* e encurtar o prompt agora no Rust, definimos o formato exato em que o modelo deve operar. 
+   * Assim, **quando formos treinar, treinaremos o modelo já nesse formato final**, evitando retrabalho e retreinos posteriores.
+
+2. **Destravamento Imediato do Gargalo de Concorrência**:
+   * O servidor atual utiliza um `std::sync::Mutex<Session>` único para o decodificador, o que limita o throughput a apenas **1 requisição por vez (concorrência = 1)**.
+   * Substituindo esse Mutex por um **Pool de Sessões Concorrentes** (`SessionPool`) com distribuição equilibrada de threads (`intra_op_threads`), o throughput salta imediatamente de 1 req/s para **3 a 5 req/s** em CPUs modernas, atingindo nossa meta de velocidade antes mesmo do fine-tuning.
+
+3. **O Servidor como um "Motor Pronto"**:
+   * O servidor Rust vira um motor de alta performance já verificado e compilado para as 8 plataformas. 
+   * Depois, o fine-tuning será apenas uma substituição de "combustível" (o arquivo de pesos `.onnx`), ganhando inteligência sem precisar reescrever o código de inferência.
+
+---
+
+## 5. O que falta fazer (Fases do Roadmap)
+
+### 📌 Fase 1: Otimizações de Throughput e Concorrência (Prioridade Imediata)
+1. **Pool de Sessões Concorrentes (`SessionPool` em `main.rs`)**:
+   * Criar um pool com $N$ instâncias de `Session` (configurável via CLI `--workers`, default automático baseado em núcleos de CPU).
+   * Gerenciamento de empréstimo assíncrono via canal Tokio (`tokio::sync::mpsc` ou `deadpool`), permitindo que requisições HTTP paralelas sejam processadas simultaneamente sem bloqueio de mutex global.
+2. **Distribuição Equilibrada de Threads (`intra_op_threads`)**:
+   * Em vez de 1 sessão monopolizar todos os 8 núcleos com contenção de thread, alocar 2 a 4 workers com 2 a 4 threads cada, maximizando a eficiência de pipeline na CPU.
+3. **Prefix Caching para Perguntas e Regras**:
+   * Caching de estados de tensores KV para prefixos de prompts repetidos (ex: políticas de reembolso, regras de triagem), derrubando a latência do prefill para **< 50ms**.
+4. **Ferramenta de Benchmark de Concorrência (`tools/bench-concurrent.js`)**:
+   * Script automatizado para disparar rajadas concorrentes (concorrência 2, 4, 8, 16) e comprovar o ganho de requisições por segundo.
+
+### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
 1. **Dataset de Treinamento**:
-   * Usar o benchmark [`multimodalart/jev-decision-index`](https://huggingface.co/datasets/multimodalart/jev-decision-index) ou extrair subconjuntos de triagem, moderação e roteamento de modelos.
-2. **Treinamento com SFT / LoRA**:
-   * Treinar o modelo base `Qwen/Qwen2.5-0.5B` ou `Qwen3.5-0.8B` usando Unsloth ou Hugging Face `trl` (`SFTTrainer`).
-   * Formato de entrada: exatamente a estrutura de prompt gerada por `native/qwen-serve/src/prompt.rs`.
-   * Função de perda: Cross-entropy apenas no token de decisão (o primeiro token gerado após as alternativas).
-3. **Exportação para ONNX Q4**:
-   * Salvar os pesos ajustados.
-   * Exportar via Optimum / ONNX Runtime com quantização INT4 (`decoder_model_merged_q4.onnx`).
-   * Criar um novo arquivo `.model` e publicar a release `v1.1.0`.
+   * Download e pré-processamento do dataset [`multimodalart/jev-decision-index`](https://huggingface.co/datasets/multimodalart/jev-decision-index) (120k perguntas em 43 benchmarks de decisão, triagem e segurança).
+2. **Treinamento com SFT / QLoRA**:
+   * Treinar o modelo base `Qwen/Qwen3.5-0.8B` com Unsloth / Hugging Face `trl`.
+   * Formato de entrada: exatamente a estrutura de prompt otimizada na Fase 1.
+   * Função de perda (Loss): Cross-entropy calculada estritamente no **primeiro token da decisão**, forçando o modelo a ter certeza absoluta de forma reflexiva sem alucinar texto longo.
+3. **Conversão e Publicação do Modelo v1.1.0**:
+   * Exportação dos pesos afinados para ONNX Q4 (`decoder_model_merged_q4.onnx`).
+   * Empacotamento do novo `.model` e publicação na Release `v1.1.0` do GitHub.
+   * Reavaliação no benchmark comparativo contra o Laya.
 
-### Fase 2: Otimizações de Throughput no Servidor Rust (Meta: 3-4 req/s)
-1. **Cache de Prefixo (KV Cache Reuse)**:
-   * Em muitos fluxos de produção, as perguntas e as instruções de sistema são idênticas, mudando apenas o `state` do usuário.
-   * Ao implementar reaproveitamento de tensores KV para prefixos repetidos, o tempo de decodificação cai para **menos de 50ms**.
-2. **Concorrência e Sessões Paralelas**:
-   * Atualmente, o servidor sincroniza chamadas ao decodificador com um `Mutex<Session>`.
-   * Criando um pool de `Session` (ex: 2 a 4 instâncias em CPU multithread), requisições concorrentes serão processadas simultaneamente, elevando o throughput de 1 req/s para **3 a 5 req/s**.
-3. **Ajuste de Intra-op Threads**:
-   * Configurar e documentar flags de afinidade de CPU (`--threads`) otimizadas por contagem de núcleos físicos.
-
-### Fase 3: Pacote NPM e CLI Pública
-1. Criar `bin/cli.js` e wrapper Node/Bun similar ao Laya (`laya-system-one`), permitindo:
+### 📌 Fase 3: Pacote NPM e CLI Pública
+1. Criar `bin/cli.js` e wrapper Node/Bun com seleção automática de arquitetura (`@sys-one` ou `@qwen-system-one`).
+2. Publicação no npm registry permitindo uso direto:
    ```bash
-   npm install qwen-system-one
    npx qwen-system-one --port 8093
    ```
-2. Adicionar detecção automática da plataforma para baixar o binário nativo correspondente gerado no CI (`qwen-serve-win32-x64`, `qwen-serve-linux-x64`, etc.).
 
 ---
 
