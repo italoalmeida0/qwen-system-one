@@ -298,20 +298,34 @@ Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de inic
 ### 📌 Fase 1: Otimizações de Throughput e Concorrência ✅ (implementada — 2026-09-28)
 Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPool ✅, threads/ORT tuning ✅, prompt enxuto+reordenado ✅, cache exato ✅, bench no CI ✅, ~~KV-prefix ❌ descartado com prova~~ → **KV-prefix ✅ na Fase 1B** (a antiga "prova" era falsa-negativa: o export tem KV real — ver seção do KV real; implementado em `48c1121`). Commits: `2a8bb84` (pool+bench), `01ec6f5` (tuning+cache exato+bench no CI), `86f9fbe` (veredito KV + prompt reordenado).
 
-### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
-Receita a replicar: **LoRA no `Qwen/Qwen3.5-0.8B` base** (como o `kirp/jpt-0.8b`), temperatura calibrada **T=1.140** (já é nosso default — não mudar no meio do treino).
-1. **Dataset de Treinamento**:
-   * Download e pré-processamento do dataset [`multimodalart/jev-decision-index`](https://huggingface.co/datasets/multimodalart/jev-decision-index) (120k perguntas em 43 benchmarks de decisão, triagem e segurança). Confirmar que é o (ou deriva o) dado que o JPT usou — ver model card/recipe do JPT-4B/9B.
-2. **Treinamento com SFT / QLoRA**:
-   * Treinar o modelo base `Qwen/Qwen3.5-0.8B` com Unsloth / Hugging Face `trl`.
-   * Formato de entrada: exatamente a estrutura de prompt otimizada na Fase 1 (**template primeiro, congelado**).
-   * Função de perda (Loss): Cross-entropy calculada estritamente no **primeiro token da decisão**, forçando o modelo a ter certeza absoluta de forma reflexiva sem alucinar texto longo.
-   * Avaliação: JevBench/Decision Index contra o JPT-0.8B (0.736 / 19.22) e contra o Laya.
-3. **Conversão e Publicação do Modelo v1.1.0**:
-   * Merge do LoRA → exportação ONNX → quant Q4 (`embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx`).
-   * ~~**Atenção**: o export atual é prefill-only (ignora `past_*` — veredito §3.6). Se o pipeline de export permitir, expor KV incremental real reabriria o prefix caching.~~ — **resolvido na Fase 1B**: o export já expunha KV incremental real e o prefix caching está implementado (ver seção do KV real).
+### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão 🔄 (EM ANDAMENTO — 2026-09-28)
+
+**Receita escolhida (mudou da rascunho antiga):** replicar o **Decider 0.8B** (`Mapika/decider-0.8b`, Apache 2.0) em vez do JPT (CC BY-NC, dataset fechado). Motivos: mesma base `Qwen3.5-0.8B-Base`, receita 100% aberta (`decider.data` + `teacher_data` no repo), mixture de dados públicos, e o card confirma o nosso formato de prompt (schema-first = template primeiro).
+
+**Referências de barra:**
+* Decider 0.8B (card): **0.776 in-task / 0.707 held-out** (1 época, 1.47M exemplos, 455M tokens, LR 1e-5, warmup 150, Brier loss).
+* JPT-0.8B: 19.22 no Decision Index (melhor 0.8B do board) / 0.736 JevBench.
+* Laya: 6.04 no Decision Index.
+
+**Nosso diferencial:** multilíngue (PT/ES/DE/ZH) — Decider e JPT são English-only, Laya colapsa fora do inglês. Dados: MINDS-14 (intenções bancárias em 5 idiomas, 555 exemplos limpos pós-overlap-check).
+
+1. **Dados ✅ (2026-09-28)**:
+   * Mixture EN oficial do Decider: `decider.data.core` (~95 datasets públicos, `teacher_data/`) → `tasks.pkl` (968.970 base) → `mixture_full.pkl` (**1.544.122** finais, com os 555 multilíngues injetados via `tools/inject_multi.py`).
+   * Multilíngue: `tools/make_multi_typed.py` converte MINDS-14 (en-US/de-DE/es-ES/pt-PT/zh-CN) para typed-decision no TEMPLATE do runtime. Overlap check 8-gram vs `tasks.pkl` EN + duplicatas internas → `multi_clean.jsonl` (555 limpos, 2 overlaps EN removidos).
+   * Tudo cacheado no Google Drive (base 1.6GB + tasks.pkl 751MB + 5 parquets + repo Decider zipado) — notebook **100% offline**, zero download no Colab.
+2. **Treinamento 🔄 (2026-09-28, Colab Pro/A100-80GB)**:
+   * `notebooks/train-qwen1-colab.ipynb` (12 células): setup → dados do Drive → overlap check → mixture+inject → treino → calibração T.
+   * Receita Decider 0.8B: 1 época, LR 1e-5 (cosine), warmup 150, `max_tokens 16384`, `max_options 255`, `schema_first_prob 0.5` (metade no formato do nosso runtime), `none_prob 0.1`.
+   * Progresso medido: tokenizing 43min (463.1M tokens, 16.932 optimizer steps) → loss caindo saudável: `ce 1.79 (step 20) → 0.71 (2800) → 0.55-0.67 (6900)`, mem 10GB/80GB, ~14k tok/s.
+   * Output: `/content/drive/MyDrive/qwen-system-one/runs/decider08_full/model` (full-finetune, não LoRA).
+3. **Conversão e Publicação do Modelo v1.1.0** ⏳ (próximo passo):
+   * Calibração do T em held-out (Decider-0.8B: 1.03; JPT: 1.140 — nosso default atual).
+   * Avaliação: `evaluate.sh` do Decider (in-task vs **0.776/0.707**) + quick-check + Decision Index cego (vs **19.22** do JPT, **6.04** do Laya).
+   * Merge → export ONNX (dual-export compat já existe no runtime: OPT fundido + padrão) → quant Q4 (`embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx`).
    * Empacotamento do novo `.model` e publicação na Release `v1.1.0` do GitHub.
    * Reavaliação no quick-check + bench (CI já mede miss vs hit separados — avaliar o modelo novo com `--cache-size 0`).
+
+> Nota: a rascunho antiga dizia "dataset `multimodalart/jev-decision-index`" e "loss CE no primeiro token". **Ambos mudaram**: o jev-decision-index é um **Space** (scores), não dataset baixável — os dados de treino vêm da mixture Decider (públicos, sem contaminação da prova cega); e a loss é **Brier multi-classe** (calibra probabilidade, não só argmax — é o que o produto vende).
 
 ### 📌 Fase 3: Pacote NPM e CLI Pública
 1. Criar `bin/cli.js` e wrapper Node/Bun com seleção automática de arquitetura (`@sys-one` ou `@qwen-system-one`).
