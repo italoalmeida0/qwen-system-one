@@ -91,6 +91,16 @@ def main():
             print(f"SKIP {locale}: sem coluna de intent {list(df.columns)}")
             continue
         # Nomes das classes: metadata do parquet (arrow schema) ou fallback.
+        # Nomes canônicos MINDS-14 (iguais nos 5 locales, verificado via API):
+        # abroad, address, app_error, atm_limit, balance, business_loan,
+        # card_issues, cash_deposit, direct_debit, freeze, high_value_payment,
+        # joint_account, latest_transactions, pay_bill.
+        CANON = [
+            "abroad", "address", "app_error", "atm_limit", "balance",
+            "business_loan", "card_issues", "cash_deposit", "direct_debit",
+            "freeze", "high_value_payment", "joint_account",
+            "latest_transactions", "pay_bill",
+        ]
         try:
             import pyarrow.parquet as pq
 
@@ -99,8 +109,9 @@ def main():
             intents = list(field.type.names) if hasattr(field.type, "names") else None
         except Exception:
             intents = None
-        if not intents:
-            intents = [f"intent_{i}" for i in sorted(df[int_col].unique().tolist())]
+        if not intents or len(intents) != len(set(intents)):
+            n_cls = len(sorted(df[int_col].unique().tolist()))
+            intents = CANON[:n_cls] if n_cls <= len(CANON) else [f"intent_{i}" for i in range(n_cls)]
         by_idx = defaultdict(list)
         for _, r in df.iterrows():
             by_idx[int(r[int_col])].append(str(r[text_col]))
