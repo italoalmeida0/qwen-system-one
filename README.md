@@ -56,6 +56,31 @@ cargo run --release --manifest-path native/qwen-serve/Cargo.toml -- --port 8093 
 > on an 8-core box saturates the CPU without oversubscription. `/health` reports the active
 > `workers` / `threads_per_session` configuration.
 
+### Hardware acceleration (opt-in, `--ep`)
+
+The default build and the default `--ep cpu` keep today's CPU numerics exactly (the decision
+contract is bit-pinned). To trade that for GPU/NPU throughput, build with an acceleration
+feature and select the EP at run time:
+
+```bash
+# Windows (Snapdragon/Adreno GPU via DirectML):
+cargo build --release --features ep-directml --manifest-path native/qwen-serve/Cargo.toml
+./qwen-serve --ep dml        # or --ep auto (best effort, silent CPU fallback)
+
+# macOS (Neural Engine/GPU via CoreML):
+cargo build --release --features ep-coreml --manifest-path native/qwen-serve/Cargo.toml
+./qwen-serve --ep coreml
+
+# Android NNAPI (ep-nnapi) and Qualcomm Hexagon QNN (ep-qnn, needs QNN runtime
+# libs on PATH) are also compiled with their features.
+```
+
+`--ep auto` tries every accelerator compiled into the binary and silently falls back to CPU if
+none registers. An explicit name (`--ep dml`) fails hard instead of degrading — use it when you
+need to be sure the GPU/NPU path is active. Note that accelerated EPs compute in reduced
+precision/fused kernels: outputs can differ from CPU in the last decimals, so keep `--ep cpu`
+for the parity benchmarks.
+
 ### 3. Send a System 1 Decision Request
 ```bash
 curl -X POST http://127.0.0.1:8093/v1/systemone \

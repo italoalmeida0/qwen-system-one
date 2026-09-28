@@ -114,6 +114,24 @@ Cache no CI: `hits=26, misses=8, entries=8` em todas — comportamento idêntico
 
 > ⚠️ Os números de throughput do bench acima são históricos: na época os níveis repetiam states já respondidos e viravam **parcialmente cache-hit** ("peak 888 req/s" era cache, não inferência). Desde 2026-09-28 o `bench-concurrent.js` **estoura o cache nos níveis** (nonce por request) e mede inferência real; o cache-hit é medido numa fase separada. Também desde então o `quick-check.js` cobre request **multi-pergunta** (caminho K>1) e o workflow ignora commits de `notebooks/`, `data/`, docs e `tools/*.py` (que não afetam os binários).
 
+**Medição real por plataforma (run `36468080454`, 2026-09-28 — níveis cache-busted, p50 por request):**
+
+| plataforma | c=1 p50 | c=1 req/s | c=4 p50 | c=4 req/s | hit p50 | multi-pergunta |
+|---|---|---|---|---|---|---|
+| `darwin-arm64` | **395ms** | **2.44** | 1574ms | 2.00 | 1ms | 1080ms |
+| `win32-x64` | 586ms | 1.68 | 1793ms | 1.70 | 3ms | 1641ms |
+| `win32-arm64` | 776ms | 1.29 | 2388ms | 1.28 | 11ms | 2370ms |
+| `linux-arm64` | 814ms | 1.23 | 2506ms | 1.19 | 4ms | 2227ms |
+| `linux-arm64-musl` | 824ms | 1.21 | 2542ms | 1.20 | 4ms | 2209ms |
+| `linux-x64` | 926ms | 1.08 | 2830ms | 1.07 | 4ms | 2640ms |
+| `linux-x64-musl` | 913ms | 1.07 | 2885ms | 1.07 | 3ms | 2464ms |
+| `darwin-x64` | 1491ms | 0.58 | 5671ms | 0.60 | 4ms | 5520ms |
+
+Padrões que confirmam o modelo do sistema (1 worker, fila serial):
+* `req/s` **plano de c=1 a c=4** e p50 **linear em c** (c=2 ≈ 2× c=1, c=4 ≈ 4× c=1): concorrência só enfileira, não paraleliza;
+* cache-hit em ~1-11ms e `hits=6/misses=20` idênticos nas 8 plataformas: o contrato de cache é determinístico;
+* multi-pergunta (3 perguntas num request) ≈ 2.7× o custo de 1 pergunta nos runners 2-vCPU (o gargalo amortiza menos), ~2.4× no `darwin-arm64` (runner M1).
+
 ### ✅ Profundidade máxima em CPU — onde o tempo realmente vai (2026-09-28)
 
 Investigação para responder "o que mais dá pra otimizar no runtime?". Medições locais (Snapdragon X 12-core), sempre com cache desligado:
@@ -155,6 +173,15 @@ O runtime cai de ~262ms → ~1100ms (0.24×) — o mesmo fator. É o envelope de
    - Windows/ARM (Snapdragon X): `dml` (Adreno GPU) ou `qnn` (Hexagon NPU) no `ort`;
    - macOS: `coreml` (Neural Engine);
    - Risco: suporte a `MatMulNBits` (Q4) por EP; precisa de flag `--ep` com fallback para CPU.
+   - **Implementado em 2026-09-28** (opt-in): build com `--features ep-directml|ep-coreml|ep-nnapi|ep-qnn`, runtime `--ep auto|dml|coreml|nnapi|qnn`. `auto` cai para CPU em silêncio; nome explícito falha alto. Default continua `cpu` (numéricos bit-idênticos).
+   - **Medido no Snapdragon X (Adreno, `--ep dml`)**: o DML registra e leva os matmuls + `lm_head` para a GPU, MAS os ops internos do GDN (sigmoid/decay/k_flatten/q_flatten/split) são forçados de volta ao CPU pela heurística do ORT ("CPU path is deemed faster") — o grafo ping-ponga CPU↔GPU com `MemcpyToHost/FromHost` **em todas as 24 camadas** (~120 cópias por prefill). Efeito líquido medido (123 tokens, 1 worker):
+
+     | condição | CPU (12 threads) | DML (Adreno) |
+     |---|---|---|
+     | frio | **~230ms** | ~1800ms |
+     | sustentado (mediana) | ~900-1140ms (colapso térmico) | **~770-910ms (flat, sem colapso)** |
+
+     GPU entrega ~20-25% sob carga contínua **e** previsibilidade (sem abismo térmico); CPU ainda vence de longe em rajada fria. A partição CPU/GPU do GDN é o que segura o ganho — próximos passos: `with_dimension_override` (shapes estáticos podem reduzir os fallbacks de Gather), QNN no Hexagon (partição pode ser melhor), ou exportar os ops GDN como um fused op aceito pela GPU. Lembrete: EP acelerado muda os últimos decimais dos logits (kernels fundidos) — manter `--ep cpu` nos benchmarks de paridade.
 2. **Export com KV real** (reabre prefix-cache: K perguntas = 1 prefill do state + K templates; ~2× em request multi-pergunta). Contrato continua igual — só o export muda.
 3. **Fase 2 (distilação/quant de ativações)**: menos params/FLOPs é a única forma de baixar latência em CPU.
 4. **Redução de tokens do prompt** (10-25%) se/ quando o contrato puder mudar — hoje 114 tokens ≈ 230ms frio.
