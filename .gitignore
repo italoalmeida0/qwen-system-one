@@ -20,6 +20,9 @@ models/tokenizer.json
 # Training data (large parquets, kept on Drive — see tools/make_multi_typed.py)
 data/train/*.parquet
 
+# HF base weights (large safetensors, kept on Drive — see notebooks/)
+models/base/
+
 # OS specific
 .DS_Store
 Thumbs.db
