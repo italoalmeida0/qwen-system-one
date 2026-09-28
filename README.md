@@ -107,6 +107,10 @@ Benchmark concurrent throughput (spawns the server, fires bursts at several conc
 node tools/bench-concurrent.js --workers 2 --levels 1,2,4,8 --requests 16
 ```
 
+> **Exact-match cache.** Identical requests (`state` + `questions` + temperature) hit an in-memory
+> LRU (default 512 entries, 10 min TTL, tunable via `--cache-size` / `--cache-ttl`) and replay in
+> ~1-2ms with zero inference. `/health` reports `cache.hits` / `misses` / `entries`.
+
 ---
 
 ## 📜 License

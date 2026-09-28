@@ -111,7 +111,7 @@ async function oneRequest(url, state) {
   }
 }
 
-async function runLevel(url, concurrency, total) {
+async function runLevel(url, concurrency, total, states = STATES) {
   const latencies = [];
   let ok = 0;
   let idx = 0;
@@ -121,7 +121,7 @@ async function runLevel(url, concurrency, total) {
     while (true) {
       const i = idx++;
       if (i >= total) return;
-      const r = await oneRequest(url, STATES[i % STATES.length]);
+      const r = await oneRequest(url, states[i % states.length]);
       latencies.push(r.dur);
       if (r.ok) ok++;
     }
@@ -191,6 +191,18 @@ async function main() {
     console.log(`--------------------------------------------------------------------------------`);
     const best = rows.reduce((a, b) => (parseFloat(b.rps) > parseFloat(a.rps) ? b : a), rows[0]);
     console.log(`[bench] peak throughput: ${best.rps} req/s at concurrency ${best.concurrency}`);
+
+    // Cache-hit phase: repeat ONE state (already answered above) at high
+    // concurrency. All should be exact-cache hits (~ms, no inference).
+    console.log(`\n[bench] cache-hit phase (repeat single state, expect ~ms)...`);
+    const hit = await runLevel(apiUrl, Math.max(...levels), perLevel, [STATES[0]]);
+    console.log(
+      `${String(`hit@${hit.concurrency}`).padStart(11)} | ${String(`${hit.ok}/${hit.total}`).padStart(8)} | ${String(hit.wallMs).padStart(8)} | ${String(hit.rps).padStart(5)} | ${String(hit.p50).padStart(7)} | ${String(hit.p95).padStart(7)} | ${String(hit.max).padStart(7)}`
+    );
+    try {
+      const h = await (await fetch(healthUrl)).json();
+      console.log(`[bench] cache stats: ${JSON.stringify(h.cache)}`);
+    } catch {}
 
     // Fail loudly if any level lost requests — concurrency must not break correctness.
     const failed = rows.filter((r) => r.ok !== r.total);

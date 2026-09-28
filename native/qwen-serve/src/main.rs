@@ -8,9 +8,12 @@
 mod prompt;
 mod schema;
 
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::anyhow;
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
@@ -39,8 +42,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
     /// Number of concurrent inference workers (ONNX session pairs).
-    /// 0 = auto (min(num_cpus, 4)). Each worker handles one request at a
-    /// time; extra requests queue on the worker's mutex (round-robin).
+    /// 0 = auto (1: a single worker using ALL cores gives the lowest
+    /// latency because this decoder scales ~linearly with threads;
+    /// more workers only help past ~16 cores). Extra requests queue on
+    /// the worker's mutex (round-robin) inside spawn_blocking.
     #[arg(long, default_value_t = 0)]
     workers: usize,
     /// Bearer API key (optional; also LAYA_API_KEY)
@@ -49,6 +54,12 @@ struct Args {
     /// Temperature for softmax (default 1.140 for Qwen 3.5 / JPT)
     #[arg(long, default_value_t = 1.140)]
     temperature: f32,
+    /// Exact-match cache size (responses; 0 = disabled)
+    #[arg(long, default_value_t = 512)]
+    cache_size: usize,
+    /// Exact-match cache TTL in seconds
+    #[arg(long, default_value_t = 600)]
+    cache_ttl: u64,
 }
 
 /// One inference worker: an independent embed + decoder session pair.
@@ -63,6 +74,65 @@ struct Worker {
     decoder: std::sync::Mutex<Session>,
 }
 
+/// Exact-match response cache (idea ported from the call_me_maybe reference
+/// project: identical prompt -> replay the stored answer at ~0ms).
+///
+/// Key = u64 hash of the canonical request bytes (state + questions +
+/// temperature). Value = the full OutBody. Bounded LRU (default 512
+/// entries) + TTL (default 10 min) so memory stays flat and stale answers
+/// expire. Hits skip tokenization AND both ONNX sessions entirely —
+/// the biggest possible saving (no FLOPs, no heat) for retries, polls
+/// and repeated triage states.
+struct ExactCache {
+    map: HashMap<u64, (OutBody, Instant)>,
+    order: VecDeque<u64>,
+    capacity: usize,
+    ttl_secs: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl ExactCache {
+    fn new(capacity: usize, ttl_secs: u64) -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new(), capacity, ttl_secs, hits: 0, misses: 0 }
+    }
+    fn get(&mut self, key: u64) -> Option<OutBody> {
+        if let Some((body, at)) = self.map.get(&key) {
+            if at.elapsed().as_secs() < self.ttl_secs {
+                self.hits += 1;
+                return Some(body.clone());
+            }
+            self.map.remove(&key);
+        }
+        self.misses += 1;
+        None
+    }
+    fn put(&mut self, key: u64, body: OutBody) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, (body, Instant::now()));
+            return;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.map.insert(key, (body, Instant::now()));
+    }
+}
+
+fn cache_key(body: &InBody, temperature: f32) -> u64 {
+    // Canonical bytes: serde_json with preserve_order keeps caller key order.
+    let mut buf = serde_json::to_vec(body).unwrap_or_default();
+    buf.extend_from_slice(&temperature.to_le_bytes());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    buf.hash(&mut h);
+    h.finish()
+}
+
 struct AppState {
     workers: Vec<Worker>,
     next: AtomicUsize,
@@ -72,13 +142,18 @@ struct AppState {
     api_key: Option<String>,
     workers_count: usize,
     threads_per_session: usize,
+    exact_cache: std::sync::Mutex<ExactCache>,
 }
 
 fn oe<T, E: std::fmt::Debug>(r: Result<T, E>) -> anyhow::Result<T> {
     r.map_err(|e| anyhow!("{e:?}"))
 }
 
-#[tokio::main(flavor = "multi_thread")]
+// Trimmed runtimes: tokio multi_thread with exactly 2 core threads
+// (accept + dispatch only; inference runs on spawn_blocking). The ORT
+// intra pool owns the other cores, so a big default tokio pool would
+// oversubscribe and fight the decoder for L3 / bandwidth.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -87,19 +162,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let api_key = args.api_key.or_else(|| std::env::var("LAYA_API_KEY").ok());
 
-    // ---- Pool sizing: spread CPU cores across workers ----
-    // workers=0  -> min(physical cores, 4). 4 workers is the sweet spot for
-    // this ~0.8B Q4 model on typical 4-8 core machines: more workers just
-    // thrash L3 / RAM bandwidth without extra throughput.
-    // threads=0  -> max(1, cores / workers), so total ORT threads ~= cores.
+    // ---- Pool sizing: one fat worker beats many thin ones ----
+    // Measured (Qwen3.5-0.8B Q4, prefill ~120 tokens): decoder latency
+    // scales ~linearly with intra threads (1t=2965ms, 2t=1402ms,
+    // 4t=695ms, 6t=503ms, 12t=233ms). Splitting cores across workers
+    // only adds contention (2x6t concurrent = ~1000ms each), so the
+    // throughput-optimal default is ONE worker with ALL cores:
+    // throughput = 1/latency. More workers help only past ~16 cores.
+    // threads=0 -> all cpus on the single worker.
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let workers_count = if args.workers > 0 {
-        args.workers
-    } else {
-        cpus.min(4).max(1)
-    };
+    let workers_count = if args.workers > 0 { args.workers } else { 1 };
     let threads_per_session = if args.threads > 0 {
         args.threads
     } else {
@@ -121,10 +195,28 @@ async fn main() -> anyhow::Result<()> {
     for i in 0..workers_count {
         let mut embed_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
         embed_builder = oe(embed_builder.with_intra_threads(threads_per_session))?;
+        // Single-chain model: sequential execution avoids inter-op pool overhead.
+        embed_builder = oe(embed_builder.with_inter_threads(1))?;
+        // Same no-spin rationale as the decoder (see below): a spinning
+        // embed pool alone keeps the SoC hot between requests.
+        embed_builder = oe(embed_builder.with_memory_pattern(false))?;
+        embed_builder = oe(embed_builder.with_intra_op_spinning(false))?;
+        embed_builder = oe(embed_builder.with_inter_op_spinning(false))?;
         let embed_session = oe(embed_builder.commit_from_file(&embed_path))?;
 
         let mut decoder_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
         decoder_builder = oe(decoder_builder.with_intra_threads(threads_per_session))?;
+        decoder_builder = oe(decoder_builder.with_inter_threads(1))?;
+        // Variable seq_len per request: disable static memory-pattern reuse
+        // (avoids reallocation stalls when shapes change between requests).
+        decoder_builder = oe(decoder_builder.with_memory_pattern(false))?;
+        // Critical on mobile SoCs (Snapdragon etc.): ORT intra threads SPIN
+        // by default after each run. 12 spinning threads = constant 100%
+        // load = the SoC drops clocks and never boosts again (first req at
+        // full speed, all later reqs throttled). Park instead of spin so
+        // cores idle between requests and boost works per request.
+        decoder_builder = oe(decoder_builder.with_intra_op_spinning(false))?;
+        decoder_builder = oe(decoder_builder.with_inter_op_spinning(false))?;
         let decoder_session = oe(decoder_builder.commit_from_file(&decoder_path))?;
         workers.push(Worker {
             embed: std::sync::Mutex::new(embed_session),
@@ -133,6 +225,14 @@ async fn main() -> anyhow::Result<()> {
         info!("worker {}/{workers_count} ready", i + 1);
     }
 
+    // Log decoder I/O (defines prefix-cache viability: present_* outputs?)
+    {
+        let first = workers[0].decoder.lock().unwrap();
+        let ins: Vec<String> = first.inputs().iter().map(|i| i.name().to_string()).collect();
+        let outs: Vec<String> = first.outputs().iter().map(|o| o.name().to_string()).collect();
+        info!("decoder inputs ({}): {:?}", ins.len(), ins);
+        info!("decoder outputs ({}): {:?}", outs.len(), outs);
+    }
     // Pre-create all static past states once (shape is identical for every
     // worker, so probe the first decoder session and share the tensors).
     let mut precreated_past: Vec<(&'static str, DynValue)> = Vec::new();
@@ -171,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         api_key,
         workers_count,
         threads_per_session,
+        exact_cache: std::sync::Mutex::new(ExactCache::new(args.cache_size, args.cache_ttl)),
     });
 
     let app = Router::new()
@@ -189,6 +290,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let (cache_hits, cache_misses, cache_len) = st
+        .exact_cache
+        .lock()
+        .map(|c| (c.hits, c.misses, c.map.len()))
+        .unwrap_or((0, 0, 0));
     Json(serde_json::json!({
         "status": "ok",
         "backend": "qwen-serve",
@@ -196,6 +302,7 @@ async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
         "runtime": "native-rust-onnx",
         "workers": st.workers_count,
         "threads_per_session": st.threads_per_session,
+        "cache": { "hits": cache_hits, "misses": cache_misses, "entries": cache_len },
     }))
 }
 
@@ -241,6 +348,15 @@ async fn systemone(
         ));
     }
 
+    // Exact-match cache: identical request bytes -> replay stored answer.
+    // Hits skip tokenization + both ONNX sessions (zero FLOPs, zero heat).
+    let key = cache_key(&body, st.temperature);
+    if let Ok(mut cache) = st.exact_cache.lock() {
+        if let Some(hit) = cache.get(key) {
+            return Ok(Json(hit));
+        }
+    }
+
     let st2 = st.clone();
     // Round-robin: each request pins to one worker for its whole lifetime.
     // If all workers are busy the request waits on that worker's Mutex
@@ -255,6 +371,11 @@ async fn systemone(
                 Json(serde_json::json!({ "error": format!("task: {e}") })),
             )
         })??;
+
+    // Store exact-match answer for future identical requests.
+    if let Ok(mut cache) = st.exact_cache.lock() {
+        cache.put(key, out.clone());
+    }
 
     Ok(Json(out))
 }

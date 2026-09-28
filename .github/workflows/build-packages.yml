@@ -95,6 +95,9 @@ jobs:
       - name: Prove the binary answers questions (10 questions)
         run: node tools/quick-check.js --binary 'dist/bin/${{ matrix.out }}'
 
+      - name: Concurrent throughput report (levels 1,2,4 + cache-hit)
+        run: node tools/bench-concurrent.js --binary 'dist/bin/${{ matrix.out }}' --port 8099 --levels 1,2,4 --requests 8
+
       - name: Upload this platform's binary
         uses: actions/upload-artifact@v4
         with:
@@ -173,6 +176,13 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -c '
             apk add --no-cache nodejs
             node tools/quick-check.js --binary dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle
+          '
+
+      - name: Concurrent throughput report inside bare Alpine
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -c '
+            apk add --no-cache nodejs
+            node tools/bench-concurrent.js --binary dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle --port 8099 --levels 1,2,4 --requests 8
           '
 
       - name: Upload this platform's package

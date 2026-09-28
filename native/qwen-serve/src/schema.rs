@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct InBody {
     #[serde(default)]
     pub model: Option<String>,
@@ -11,7 +11,7 @@ pub struct InBody {
     pub questions: BTreeMap<String, QDef>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct QDef {
     #[serde(rename = "type")]
     pub qtype: String,
@@ -23,14 +23,14 @@ pub struct QDef {
     pub threshold: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct OutBody {
     pub model: String,
     pub answers: serde_json::Value,
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
