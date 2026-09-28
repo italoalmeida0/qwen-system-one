@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "model:acquire": "node ./tools/acquire-model.js",
-    "quick:check": "node ./tools/quick-check.js"
+    "quick:check": "node ./tools/quick-check.js",
+    "bench:concurrent": "node ./tools/bench-concurrent.js"
   },
   "repository": {
     "type": "git",

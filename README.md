@@ -43,9 +43,18 @@ Downloads `qwen-0.8b-q4.model` from GitHub Releases, verifies SHA256, and extrac
 # Build & run from source (Rust 1.80+)
 cargo run --release --manifest-path native/qwen-serve/Cargo.toml -- --port 8093
 
+# Tune concurrency: N workers x M intra-op threads (defaults: auto = min(cpus,4) workers, cpus/workers threads)
+cargo run --release --manifest-path native/qwen-serve/Cargo.toml -- --port 8093 --workers 4 --threads 2
+
 # Or execute a prebuilt binary directly
 ./qwen-serve --port 8093
 ```
+
+> **Concurrency model.** Each `--workers` slot owns an independent embed+decoder ONNX session pair.
+> Requests are distributed round-robin; when all workers are busy, extra requests queue on the
+> worker's mutex (OS-parked, no spin). Total ORT threads ≈ CPU cores, so `--workers 4 --threads 2`
+> on an 8-core box saturates the CPU without oversubscription. `/health` reports the active
+> `workers` / `threads_per_session` configuration.
 
 ### 3. Send a System 1 Decision Request
 ```bash
@@ -91,6 +100,11 @@ Response:
 Run the automated 10-question triage test suite:
 ```bash
 node tools/quick-check.js
+```
+
+Benchmark concurrent throughput (spawns the server, fires bursts at several concurrency levels):
+```bash
+node tools/bench-concurrent.js --workers 2 --levels 1,2,4,8 --requests 16
 ```
 
 ---

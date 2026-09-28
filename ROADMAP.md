@@ -106,16 +106,16 @@ Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de inic
 
 ## 5. O que falta fazer (Fases do Roadmap)
 
-### 📌 Fase 1: Otimizações de Throughput e Concorrência (Prioridade Imediata)
-1. **Pool de Sessões Concorrentes (`SessionPool` em `main.rs`)**:
-   * Criar um pool com $N$ instâncias de `Session` (configurável via CLI `--workers`, default automático baseado em núcleos de CPU).
-   * Gerenciamento de empréstimo assíncrono via canal Tokio (`tokio::sync::mpsc` ou `deadpool`), permitindo que requisições HTTP paralelas sejam processadas simultaneamente sem bloqueio de mutex global.
-2. **Distribuição Equilibrada de Threads (`intra_op_threads`)**:
-   * Em vez de 1 sessão monopolizar todos os 8 núcleos com contenção de thread, alocar 2 a 4 workers com 2 a 4 threads cada, maximizando a eficiência de pipeline na CPU.
-3. **Prefix Caching para Perguntas e Regras**:
+### 📌 Fase 1: Otimizações de Throughput e Concorrência ✅ (implementada — 2026-09-28)
+1. **Pool de Sessões Concorrentes (`SessionPool` em `main.rs`)** ✅:
+   * Pool com $N$ pares embed+decoder (`Worker`), configurável via CLI `--workers` (default `min(cpus, 4)`).
+   * Distribuição round-robin via `AtomicUsize`; requisições excedentes aguardam no `Mutex` do worker dentro de `spawn_blocking` (sem spin, sem deadlock).
+2. **Distribuição Equilibrada de Threads (`intra_op_threads`)** ✅:
+   * `--threads` por worker (default `cpus / workers`), total ORT ≈ núcleos físicos. `/health` reporta `workers` e `threads_per_session`.
+3. **Prefix Caching para Perguntas e Regras** ⏳ (próximo passo da Fase 1):
    * Caching de estados de tensores KV para prefixos de prompts repetidos (ex: políticas de reembolso, regras de triagem), derrubando a latência do prefill para **< 50ms**.
-4. **Ferramenta de Benchmark de Concorrência (`tools/bench-concurrent.js`)**:
-   * Script automatizado para disparar rajadas concorrentes (concorrência 2, 4, 8, 16) e comprovar o ganho de requisições por segundo.
+4. **Ferramenta de Benchmark de Concorrência (`tools/bench-concurrent.js`)** ✅:
+   * Rajadas concorrentes (concorrência 1, 2, 4, 8 configurável) com warmup, p50/p95 e taxa de sucesso. Validado localmente: 8/8 OK em todos os níveis, pico 1.46 req/s em build debug (release será mais rápido).
 
 ### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão (Superar o Laya)
 1. **Dataset de Treinamento**:

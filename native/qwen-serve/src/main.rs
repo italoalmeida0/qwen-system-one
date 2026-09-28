@@ -10,6 +10,7 @@ mod schema;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::anyhow;
 use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
@@ -34,9 +35,14 @@ struct Args {
     /// Bind port (0 = pick free port, prints it for the spawner)
     #[arg(long, default_value_t = 8093)]
     port: u16,
-    /// Intra-op threads (0 = ORT default)
+    /// Intra-op threads per worker (0 = auto: cpus / workers)
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Number of concurrent inference workers (ONNX session pairs).
+    /// 0 = auto (min(num_cpus, 4)). Each worker handles one request at a
+    /// time; extra requests queue on the worker's mutex (round-robin).
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
     /// Bearer API key (optional; also LAYA_API_KEY)
     #[arg(long)]
     api_key: Option<String>,
@@ -45,13 +51,27 @@ struct Args {
     temperature: f32,
 }
 
+/// One inference worker: an independent embed + decoder session pair.
+///
+/// ONNX `Session::run` takes `&mut self`, so a single session can only run
+/// one inference at a time. A pool of N pairs allows N concurrent requests.
+/// Requests are distributed round-robin via `AppState::next`; when more
+/// requests than workers arrive, they queue naturally on the worker's
+/// `Mutex` inside `spawn_blocking` threads (no busy-spin, no deadlock).
+struct Worker {
+    embed: std::sync::Mutex<Session>,
+    decoder: std::sync::Mutex<Session>,
+}
+
 struct AppState {
-    embed_session: std::sync::Mutex<Session>,
-    decoder_session: std::sync::Mutex<Session>,
+    workers: Vec<Worker>,
+    next: AtomicUsize,
     tokenizer: Tokenizer,
     precreated_past: Vec<(&'static str, DynValue)>,
     temperature: f32,
     api_key: Option<String>,
+    workers_count: usize,
+    threads_per_session: usize,
 }
 
 fn oe<T, E: std::fmt::Debug>(r: Result<T, E>) -> anyhow::Result<T> {
@@ -67,43 +87,72 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let api_key = args.api_key.or_else(|| std::env::var("LAYA_API_KEY").ok());
 
+    // ---- Pool sizing: spread CPU cores across workers ----
+    // workers=0  -> min(physical cores, 4). 4 workers is the sweet spot for
+    // this ~0.8B Q4 model on typical 4-8 core machines: more workers just
+    // thrash L3 / RAM bandwidth without extra throughput.
+    // threads=0  -> max(1, cores / workers), so total ORT threads ~= cores.
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let workers_count = if args.workers > 0 {
+        args.workers
+    } else {
+        cpus.min(4).max(1)
+    };
+    let threads_per_session = if args.threads > 0 {
+        args.threads
+    } else {
+        (cpus / workers_count).max(1)
+    };
+    info!("pool: {workers_count} workers x {threads_per_session} intra threads ({cpus} cpus)");
+
     // ---- ONNX Runtime init ----
     ort::init().with_name("qwen-serve").commit();
 
     let opt_level = GraphOptimizationLevel::Level3;
 
     let embed_path = args.model_dir.join("embed_tokens_q4.onnx");
-    info!("loading embed session from {}", embed_path.display());
-    let mut embed_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
-    if args.threads > 0 {
-        embed_builder = oe(embed_builder.with_intra_threads(args.threads))?;
-    }
-    let embed_session = oe(embed_builder.commit_from_file(&embed_path))?;
-
     let decoder_path = args.model_dir.join("decoder_model_merged_q4.onnx");
+    info!("loading embed session from {}", embed_path.display());
     info!("loading decoder session from {}", decoder_path.display());
-    let mut decoder_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
-    if args.threads > 0 {
-        decoder_builder = oe(decoder_builder.with_intra_threads(args.threads))?;
-    }
-    let decoder_session = oe(decoder_builder.commit_from_file(&decoder_path))?;
 
-    // Pre-create all static past states once
+    let mut workers: Vec<Worker> = Vec::with_capacity(workers_count);
+    for i in 0..workers_count {
+        let mut embed_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
+        embed_builder = oe(embed_builder.with_intra_threads(threads_per_session))?;
+        let embed_session = oe(embed_builder.commit_from_file(&embed_path))?;
+
+        let mut decoder_builder = oe(Session::builder()?.with_optimization_level(opt_level))?;
+        decoder_builder = oe(decoder_builder.with_intra_threads(threads_per_session))?;
+        let decoder_session = oe(decoder_builder.commit_from_file(&decoder_path))?;
+        workers.push(Worker {
+            embed: std::sync::Mutex::new(embed_session),
+            decoder: std::sync::Mutex::new(decoder_session),
+        });
+        info!("worker {}/{workers_count} ready", i + 1);
+    }
+
+    // Pre-create all static past states once (shape is identical for every
+    // worker, so probe the first decoder session and share the tensors).
     let mut precreated_past: Vec<(&'static str, DynValue)> = Vec::new();
-    for inp in decoder_session.inputs().iter() {
-        let name = inp.name().to_string();
-        if name.starts_with("past_conv") {
-            let data = vec![0.0f32; 1 * 6144 * 3];
-            let t = oe(Tensor::from_array((vec![1, 6144, 3], data.into_boxed_slice())))?;
-            precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
-        } else if name.starts_with("past_recurrent") {
-            let data = vec![0.0f32; 1 * 16 * 128 * 128];
-            let t = oe(Tensor::from_array((vec![1, 16, 128, 128], data.into_boxed_slice())))?;
-            precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
-        } else if name.starts_with("past_key_values") {
-            let data = vec![0.0f32; 0];
-            let t = oe(Tensor::from_array((vec![1, 2, 0, 256], data.into_boxed_slice())))?;
-            precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+    {
+        let first = workers[0].decoder.lock().unwrap();
+        for inp in first.inputs().iter() {
+            let name = inp.name().to_string();
+            if name.starts_with("past_conv") {
+                let data = vec![0.0f32; 1 * 6144 * 3];
+                let t = oe(Tensor::from_array((vec![1, 6144, 3], data.into_boxed_slice())))?;
+                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+            } else if name.starts_with("past_recurrent") {
+                let data = vec![0.0f32; 1 * 16 * 128 * 128];
+                let t = oe(Tensor::from_array((vec![1, 16, 128, 128], data.into_boxed_slice())))?;
+                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+            } else if name.starts_with("past_key_values") {
+                let data = vec![0.0f32; 0];
+                let t = oe(Tensor::from_array((vec![1, 2, 0, 256], data.into_boxed_slice())))?;
+                precreated_past.push((name.leak() as &'static str, DynValue::from(t)));
+            }
         }
     }
     info!("pre-created {} past state tensors", precreated_past.len());
@@ -114,12 +163,14 @@ async fn main() -> anyhow::Result<()> {
     let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| anyhow!("{e:?}"))?;
 
     let state = Arc::new(AppState {
-        embed_session: std::sync::Mutex::new(embed_session),
-        decoder_session: std::sync::Mutex::new(decoder_session),
+        workers,
+        next: AtomicUsize::new(0),
         tokenizer,
         precreated_past,
         temperature: args.temperature,
         api_key,
+        workers_count,
+        threads_per_session,
     });
 
     let app = Router::new()
@@ -137,12 +188,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "backend": "qwen-serve",
         "model": "onnx-community/Qwen3.5-0.8B-ONNX-OPT",
-        "runtime": "native-rust-onnx"
+        "runtime": "native-rust-onnx",
+        "workers": st.workers_count,
+        "threads_per_session": st.threads_per_session,
     }))
 }
 
@@ -189,7 +242,12 @@ async fn systemone(
     }
 
     let st2 = st.clone();
-    let out = tokio::task::spawn_blocking(move || infer_all(&st2, &body))
+    // Round-robin: each request pins to one worker for its whole lifetime.
+    // If all workers are busy the request waits on that worker's Mutex
+    // inside spawn_blocking (OS-parked, no spin). Requests are independent,
+    // so head-of-line blocking across workers cannot happen.
+    let worker_idx = st.next.fetch_add(1, Ordering::Relaxed) % st.workers.len();
+    let out = tokio::task::spawn_blocking(move || infer_all(&st2, worker_idx, &body))
         .await
         .map_err(|e| {
             (
@@ -201,7 +259,7 @@ async fn systemone(
     Ok(Json(out))
 }
 
-fn infer_all(st: &AppState, body: &InBody) -> Result<OutBody, (StatusCode, Json<serde_json::Value>)> {
+fn infer_all(st: &AppState, worker_idx: usize, body: &InBody) -> Result<OutBody, (StatusCode, Json<serde_json::Value>)> {
     let err500 = |what: &str, e: std::fmt::Arguments| -> (StatusCode, Json<serde_json::Value>) {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,7 +295,7 @@ fn infer_all(st: &AppState, body: &InBody) -> Result<OutBody, (StatusCode, Json<
             .map_err(|e| err500("input_ids", format_args!("{e:?}")))?;
 
         let embed_data: Vec<f32> = {
-            let mut embed_session = st.embed_session.lock().unwrap();
+            let mut embed_session = st.workers[worker_idx].embed.lock().unwrap();
             let embed_out = embed_session
                 .run(ort::inputs!["input_ids" => t_ids])
                 .map_err(|e| err500("embed_run", format_args!("{e:?}")))?;
@@ -283,7 +341,7 @@ fn infer_all(st: &AppState, body: &InBody) -> Result<OutBody, (StatusCode, Json<
         // 4. Run decoder session
         let t_dec_start = std::time::Instant::now();
         let target_logits: Vec<f32> = {
-            let mut decoder_session = st.decoder_session.lock().unwrap();
+            let mut decoder_session = st.workers[worker_idx].decoder.lock().unwrap();
             let decoder_out = decoder_session
                 .run(inputs)
                 .map_err(|e| err500("decoder_run", format_args!("{e:?}")))?;
@@ -304,7 +362,7 @@ fn infer_all(st: &AppState, body: &InBody) -> Result<OutBody, (StatusCode, Json<
         let t_total = t_start.elapsed();
 
         eprintln!(
-            "[{qid}] total={:?} (embed={:?}, prep={:?}, decoder={:?}, tokens={seq_len})",
+            "[w{worker_idx}:{qid}] total={:?} (embed={:?}, prep={:?}, decoder={:?}, tokens={seq_len})",
             t_total, t_embed_dur, t_prep_dur, t_dec_dur
         );
 
