@@ -91,9 +91,9 @@ Todas as decisões abaixo foram tomadas com **número medido**, não chute. Brea
 **Local (Snapdragon X 12-core, release, 1 worker × 12 threads):**
 | Condição | Latência/req | Throughput |
 |---|---|---|
-| Máquina fresca, miss (inferência nova) | **~233ms** | **~4.3 req/s ✅ meta** |
+| Máquina fresca, miss (inferência nova) | **~233–262ms** | **~4.3 req/s ✅ meta** |
 | Cache-hit (request repetido) | **~1–2ms** | **~1000 req/s** |
-| Carga sustentada (throttling térmico do SoC, constante longa) | ~1000ms | ~1 req/s |
+| Carga sustentada (limite de potência do SoC, constante longa) | ~1100ms | ~0.9 req/s |
 
 > Nota térmica: degradação sob carga sustentada foi isolada como **throttling do SoC** (processo fresco = sempre ~300ms 4/4; cooldown de 60s não recupera; memória estável em ~680MB, sem vazamento; spinning/vazamento/memory-pattern descartados por teste). Não é bug de código — é física de fanless sob AVX/intenso. Menos FLOPs por request (Fase 2: modelo treinado, prompt menor) é o ataque correto.
 
@@ -112,10 +112,78 @@ Todas as decisões abaixo foram tomadas com **número medido**, não chute. Brea
 
 Cache no CI: `hits=26, misses=8, entries=8` em todas — comportamento idêntico nas 8 plataformas. Miss em runner 2-vCPU (~800ms/prefill de 800M params) é limite físico, não tuning.
 
+> ⚠️ Os números de throughput do bench acima são históricos: na época os níveis repetiam states já respondidos e viravam **parcialmente cache-hit** ("peak 888 req/s" era cache, não inferência). Desde 2026-09-28 o `bench-concurrent.js` **estoura o cache nos níveis** (nonce por request) e mede inferência real; o cache-hit é medido numa fase separada. Também desde então o `quick-check.js` cobre request **multi-pergunta** (caminho K>1) e o workflow ignora commits de `notebooks/`, `data/`, docs e `tools/*.py` (que não afetam os binários).
+
+### ✅ Profundidade máxima em CPU — onde o tempo realmente vai (2026-09-28)
+
+Investigação para responder "o que mais dá pra otimizar no runtime?". Medições locais (Snapdragon X 12-core), sempre com cache desligado:
+
+**1. O prefill é compute-bound (não memory-bound).** Latência vs. tokens do prompt é linear com intercepto pequeno:
+
+| tokens | latência | ms/token |
+|---|---|---|
+| 125 | 1105ms | 8.8 |
+| 161 | 1221ms | 7.6 |
+| 244 | 1859ms | 7.6 |
+| 377 | 2825ms | 7.5 |
+
+Consequências: (a) **batchar N perguntas numa passada só não reduz FLOPs** — o ganho seria só overhead de `session.run()` (~5-10ms/pergunta) e eficiência de kernel, insuficiente para justificar padding/numerics; (b) KV-prefix caching valeria à pena **mesmo sendo compute-bound** (pularia os FLOPs do prefixo compartilhado), mas o export atual ignora `past_*` (ver "Itens mortos"); (c) o único ataque real é **menos FLOPs** (modelo/prompt menores) ou **mais FLOPs por watt** (EP de NPU/GPU).
+
+**2. O colapso sob carga sustentada é do SoC, provado fora do runtime.** Stress de CPU puro (matmul numpy, sem qwen-serve):
+
+| janela | GFLOPS | relativo |
+|---|---|---|
+| 0-5s | 330 | 1.00× |
+| 10-45s | 81-98 | **0.25-0.30×** |
+
+O runtime cai de ~262ms → ~1100ms (0.24×) — o mesmo fator. É o envelope de potência/térmico do Snapdragon X (fanless), não código, não ORT, não tuning.
+
+**3. Threads não mudam o sustentado.** Mediana sustentada por nº de threads (10 requests seguidos, mediana do request 3-10, 2 passadas):
+
+| threads | frio (best 2) | sustentado (mediana) |
+|---|---|---|
+| 12 | 262ms | 1103ms |
+| 8 | 305ms | 1097ms |
+| 6 | 408ms | 1156ms |
+| 4 | 545ms | 1091ms |
+
+4-12 threads convergem para ~1100ms: menos threads só perdem burst (mais clocks por core não compensam menos cores). **Default de 12 threads continua correto**; nenhum tuning de thread resolve o teto.
+
+**4. Teto do runtime em CPU atingido.** Custo por request: decoder ~95%, embed ~2-3%, prep ~1%. Com prefill compute-bound, prompt congelado e export sem KV, o que sobra em código é ruído (<5%, abaixo da variância térmica). O caminho para os 250ms **sustentados** (não só burst) passa por:
+
+1. **EP de NPU/GPU** (mais FLOPs por watt — ataca exatamente o gargalo medido):
+   - Windows/ARM (Snapdragon X): `dml` (Adreno GPU) ou `qnn` (Hexagon NPU) no `ort`;
+   - macOS: `coreml` (Neural Engine);
+   - Risco: suporte a `MatMulNBits` (Q4) por EP; precisa de flag `--ep` com fallback para CPU.
+2. **Export com KV real** (reabre prefix-cache: K perguntas = 1 prefill do state + K templates; ~2× em request multi-pergunta). Contrato continua igual — só o export muda.
+3. **Fase 2 (distilação/quant de ativações)**: menos params/FLOPs é a única forma de baixar latência em CPU.
+4. **Redução de tokens do prompt** (10-25%) se/ quando o contrato puder mudar — hoje 114 tokens ≈ 230ms frio.
+5. **Micro-batching entre requests concorrentes** (só para throughput, não latência): hoje c=2/4 apenas enfileira (mesmo ~1 req/s); batch de verdade exigiria batch-dim dinâmico + scheduler.
+
 ### ✅ Empacotamento e Publicação da Base
 * Modelo base empacotado em `models/qwen-0.8b-q4.model` (533 MB).
 * Publicado como release asset no GitHub: [Release v1.0.0](https://github.com/italoalmeida0/qwen-system-one/releases/tag/v1.0.0).
 * Script de aquisição e extração com verificação SHA256 implementado (`tools/acquire-model.js`).
+
+### ✅ CI — tempos por job e o que foi otimizado (2026-09-28)
+
+Run `36454700663` (8 jobs em paralelo, wall total **4m18s** — o wall é definido pelo job mais lento):
+
+| job | total | etapas dominantes |
+|---|---|---|
+| `darwin-x64` | **4m14s** (caminho crítico) | brew ORT 41s + build 1m55s + modelo 23s + smoke 45s |
+| `linux-x64-musl` | **3m50s** | build Docker/Alpine **2m58s** (compilava tudo do zero) |
+| `win32-arm64` | 2m41s | build 1m49s |
+| `win32-x64` | 2m38s | build 1m45s |
+| `linux-arm64-musl` | 2m50s | build Docker **2m08s** |
+| `darwin-arm64` | 1m48s | build 22s (deps via rust-cache) |
+| `linux-x64` / `linux-arm64` | 1m18s / 1m02s | build ~20s (rust-cache) |
+
+Otimizações aplicadas (2026-09-28):
+* `paths-ignore` no push: commits de `notebooks/`, `data/`, `call/`, `*.md` e `tools/*.py` não disparam mais os 8 builds nativos (a maior parte dos pushes do dia era só notebook/dados — hoje cada um gastava ~25 min de runner);
+* cache do cargo registry + árvore de build musl (`.cargo-musl`/`.target-musl`, keyed no `Cargo.lock`): o container Alpine recompilava a árvore inteira a cada run (~130-180s);
+* `HOMEBREW_NO_AUTO_UPDATE=1` no job darwin-x64 (o `brew update` custava ~30s e não agregava);
+* bench com inferência real (`--requests 6` para compensar o custo maior).
 
 ---
 
