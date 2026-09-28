@@ -41,10 +41,25 @@ async function main() {
 
   if (!fs.existsSync(modelArchive)) {
     console.log(`[acquire] downloading ${manifest.model} from ${manifest.source}...`);
-    const resp = await fetch(manifest.source);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching model archive: ${resp.statusText}`);
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    fs.writeFileSync(modelArchive, buffer);
+    let downloaded = false;
+    try {
+      execSync(`curl -sL -f --retry 3 --retry-delay 2 -o "${modelArchive}.tmp" "${manifest.source}"`, { stdio: 'inherit' });
+      fs.renameSync(`${modelArchive}.tmp`, modelArchive);
+      downloaded = true;
+    } catch {}
+
+    if (!downloaded) {
+      const { pipeline } = await import('node:stream/promises');
+      const { Readable } = await import('node:stream');
+      const resp = await fetch(manifest.source, {
+        headers: { 'user-agent': 'qwen-system-one-acquire' },
+        redirect: 'follow'
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching model archive: ${resp.statusText}`);
+      const fileStream = fs.createWriteStream(`${modelArchive}.tmp`);
+      await pipeline(Readable.fromWeb(resp.body), fileStream);
+      fs.renameSync(`${modelArchive}.tmp`, modelArchive);
+    }
   }
 
   console.log('[acquire] verifying model archive sha256...');

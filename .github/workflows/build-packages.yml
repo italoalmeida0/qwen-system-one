@@ -36,15 +36,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: native/qwen-serve }
 
-      - name: Provide ORT libs for mac-x64 (no ort-sys prebuilt)
+      - name: Provide ORT libs for mac-x64 via Homebrew
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
         run: |
           set -euo pipefail
-          curl -sL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-osx-x86_64-1.23.0.tgz"
+          brew install onnxruntime
           mkdir -p "$GITHUB_WORKSPACE/ort-libs"
-          tar -xzf /tmp/ort.tgz -C "$GITHUB_WORKSPACE/ort-libs" --strip-components=1
-          find "$GITHUB_WORKSPACE/ort-libs" -name 'libonnxruntime*.dylib' -exec cp {} "$GITHUB_WORKSPACE/ort-libs/" \;
+          ORT_PREFIX="$(brew --prefix onnxruntime)"
+          cp "$ORT_PREFIX/lib"/libonnxruntime*.dylib "$GITHUB_WORKSPACE/ort-libs/"
 
       - name: Build qwen-serve
         shell: bash
@@ -53,7 +53,7 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
             export ORT_LIB_PATH="$GITHUB_WORKSPACE/ort-libs"
             export ORT_PREFER_DYNAMIC_LINK=1
-            cargo build --release --no-default-features --features mac-x64-legacy --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
+            cargo build --release --no-default-features --features mac-x64 --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
           else
             cargo build --release --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
           fi
