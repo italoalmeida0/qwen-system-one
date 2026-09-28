@@ -120,11 +120,15 @@ def main():
         for i in range(0, len(idxs), args.max_options):
             grp = idxs[i : i + args.max_options]
             opts = [intents[j] for j in grp]
+            seen_utt = set()
             for j in grp:
                 pool = by_idx.get(j, [])
                 if not pool:
                     continue
                 for utt in random.sample(pool, min(args.per_intent, len(pool))):
+                    if utt in seen_utt:
+                        continue
+                    seen_utt.add(utt)
                     out.append(to_typed(utt, HEADS[locale], opts, intents[j]))
         print(f"{locale}: +{len(out)-n0} exemplos ({len(intents)} intents)")
 
