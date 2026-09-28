@@ -23,6 +23,10 @@ const val = (name, def) => {
 
 const modelDir = path.resolve(ROOT, val('model', 'models'));
 const port = parseInt(val('port', '8093'), 10);
+// Optional --ep is forwarded to the spawned server (cpu|auto|dml|coreml|nnapi|qnn);
+// --cases N truncates the case list (for slow EP smoke runs on software adapters).
+const ep = val('ep', null);
+const maxCases = parseInt(val('cases', '0'), 10);
 
 let explicitBinary = val('binary', null);
 if (!explicitBinary) {
@@ -38,7 +42,7 @@ if (!fs.existsSync(binPath)) {
   process.exit(1);
 }
 
-const CASES = [
+const ALL_CASES = [
   ['We were billed twice on the March invoice and want a refund.', 'billing'],
   ['The application crashes with a segfault when I open the settings page.', 'tech'],
   ['Fui cobrado em duplicidade na minha fatura e quero reembolso.', 'billing'],
@@ -50,6 +54,7 @@ const CASES = [
   ['Can you send me a quote for the business tier?', 'sales'],
   ['We would like to purchase more seats for our account.', 'sales']
 ];
+const CASES = maxCases > 0 ? ALL_CASES.slice(0, maxCases) : ALL_CASES;
 
 const QUESTIONS = {
   department: {
@@ -88,7 +93,7 @@ async function main() {
   console.log(`[quick-check] models: ${modelDir}`);
   console.log(`[quick-check] port  : ${port}`);
 
-  const child = spawn(binPath, ['--model-dir', modelDir, '--port', String(port), '--host', '127.0.0.1'], {
+  const child = spawn(binPath, ['--model-dir', modelDir, '--port', String(port), '--host', '127.0.0.1', ...(ep ? ['--ep', ep] : [])], {
     stdio: ['ignore', 'inherit', 'inherit']
   });
 
