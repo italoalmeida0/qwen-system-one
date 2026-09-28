@@ -5,6 +5,14 @@ on:
   push:
     branches: [ main, master ]
     tags: [ 'v*' ]
+    # Training/data/doc work must not trigger 8-platform native builds.
+    # (Tag pushes still always run: path filters are not evaluated for tags.)
+    paths-ignore:
+      - 'notebooks/**'
+      - 'data/**'
+      - 'call/**'
+      - '**.md'
+      - 'tools/*.py'
 
 concurrency:
   group: build-packages-${{ github.ref }}
@@ -39,6 +47,8 @@ jobs:
       - name: Provide ORT libs for mac-x64 via Homebrew
         if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'   # brew update costs ~30s and buys nothing here
         run: |
           set -euo pipefail
           brew install onnxruntime
@@ -96,7 +106,7 @@ jobs:
         run: node tools/quick-check.js --binary 'dist/bin/${{ matrix.out }}'
 
       - name: Concurrent throughput report (levels 1,2,4 + cache-hit)
-        run: node tools/bench-concurrent.js --binary 'dist/bin/${{ matrix.out }}' --port 8099 --levels 1,2,4 --requests 8
+        run: node tools/bench-concurrent.js --binary 'dist/bin/${{ matrix.out }}' --port 8099 --levels 1,2,4 --requests 6
 
       - name: Upload this platform's binary
         uses: actions/upload-artifact@v4
@@ -121,6 +131,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cargo downloads + compiled deps for the musl target. Without this the
+      # Alpine container recompiles the whole tree every run (~130-180s).
+      - name: Cache cargo registry + musl build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-musl
+            .target-musl
+          key: musl-${{ matrix.arch }}-${{ hashFiles('native/qwen-serve/Cargo.lock') }}
+          restore-keys: |
+            musl-${{ matrix.arch }}-
+
       - name: Build in Alpine and copy the musl libs it links
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -euxc '
@@ -129,11 +151,14 @@ jobs:
             apk add --no-cache nodejs npm build-base rust cargo pkgconf openssl-dev onnxruntime onnxruntime-dev
             export ORT_LIB_PATH=/usr/lib
             export ORT_PREFER_DYNAMIC_LINK=1
+            export CARGO_HOME=/work/.cargo-musl
+            export CARGO_TARGET_DIR=/work/.target-musl
             cargo build --release --manifest-path native/qwen-serve/Cargo.toml
+            rm -rf "$CARGO_TARGET_DIR/release/incremental"
 
             SLOT=dist/bin/linux-${{ matrix.arch }}-musl
             mkdir -p "$SLOT/lib"
-            cp native/qwen-serve/target/release/qwen-serve "$SLOT/qwen-serve"
+            cp "$CARGO_TARGET_DIR/release/qwen-serve" "$SLOT/qwen-serve"
 
             apk add --no-cache curl
             copy_deps() {
@@ -155,7 +180,7 @@ jobs:
 
       - name: Take ownership of everything the container wrote as root
         run: |
-          sudo chown -R "$(id -u):$(id -g)" dist native 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" dist native .cargo-musl .target-musl 2>/dev/null || true
 
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
@@ -182,7 +207,7 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work alpine:3.22 sh -c '
             apk add --no-cache nodejs
-            node tools/bench-concurrent.js --binary dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle --port 8099 --levels 1,2,4 --requests 8
+            node tools/bench-concurrent.js --binary dist/bin/linux-${{ matrix.arch }}-musl/qwen-serve.bundle --port 8099 --levels 1,2,4 --requests 6
           '
 
       - name: Upload this platform's package
