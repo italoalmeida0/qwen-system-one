@@ -45,14 +45,21 @@ def main():
     from decider import data as D
 
     mix = pickle.load(open(args.mixture, "rb"))
-    print("mixture keys:", list(mix.keys()) if isinstance(mix, dict) else type(mix))
+    print("mixture type:", type(mix).__name__)
 
-    # A mixture é dict {split_name: [Example]} ou lista — descobre e injeta no train.
-    if isinstance(mix, dict):
+    # Formatos conhecidos: tuple (train_list, eval_dict) [decider.data.load_cache],
+    # dict {split: [Example]}, ou lista direta. Injeta sempre na lista de train.
+    train = None
+    if isinstance(mix, tuple) and len(mix) == 2:
+        train, eval_part = mix
+        print(f"tuple: train={len(train)} eval_tasks={len(eval_part) if hasattr(eval_part, '__len__') else '?'}")
+    elif isinstance(mix, dict):
         train_key = next((k for k in mix if "train" in k.lower()), list(mix.keys())[0])
         train = mix[train_key]
+    elif isinstance(mix, list):
+        train = mix
     else:
-        train, train_key = mix, None
+        raise SystemExit(f"formato de mixture desconhecido: {type(mix)}")
 
     added = 0
     for line in open(args.jsonl, encoding="utf-8"):
@@ -65,12 +72,14 @@ def main():
         train.append(D.Example(state, [q], args.task))
         added += 1
 
-    if train_key:
+    if isinstance(mix, tuple):
+        mix = (train, eval_part)
+    elif isinstance(mix, dict):
         mix[train_key] = train
     else:
         mix = train
     pickle.dump(mix, open(args.out, "wb"))
-    print(f"injetados: {added} exemplos task={args.task} -> {args.out}")
+    print(f"injetados: {added} exemplos task={args.task} -> {args.out} (train agora: {len(train)})")
 
 
 if __name__ == "__main__":
