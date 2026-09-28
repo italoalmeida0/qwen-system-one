@@ -6,6 +6,8 @@
 [![Model](https://img.shields.io/badge/Model-Qwen%203.5%200.8B%20Q4%20ONNX-blueviolet.svg)](https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX-OPT)
 
 > **High-performance, self-contained System 1 decision engine based on Qwen 3.5 0.8B Q4 ONNX. Zero Python dependencies, pure Rust native binary (`qwen-serve`) with statically linked ONNX Runtime and Axum. 100% wire-compatible with TypeSafe Jev (`POST /v1/systemone`).**
+>
+> 📋 **Visão Geral, Arquitetura e Próximos Passos:** Veja o [**ROADMAP.md**](ROADMAP.md) para detalhes completos do projeto, objetivos de benchmark e guia de handoff.
 
 ---
 
