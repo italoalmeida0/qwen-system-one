@@ -212,6 +212,10 @@ Otimizações aplicadas (2026-09-28):
 * `HOMEBREW_NO_AUTO_UPDATE=1` no job darwin-x64 (o `brew update` custava ~30s e não agregava);
 * bench com inferência real (`--requests 6` para compensar o custo maior).
 
+Efeito medido (runs `36468080454` frio → `36468815911` cache quente): "Build in Alpine" **2m58s/2m08s → 63s/55s** (x64/arm64), jobs musl totais **3m50s/2m50s → 2m08s/1m57s**, `brew install` darwin-x64 41s → 24s. Wall total do run: 4m26s → 4m38s (estável — agora definido pelo `darwin-x64`: build 96s + brew 24s + modelo + smokes em série).
+
+**Fase extra (2026-09-28 tarde): EP de aceleração opt-in.** Os jobs `win32-*` agora compilam com `ep-directml` e `darwin-*` com `ep-coreml`, mais um smoke `--ep auto --cases 2` em ambas (prova o caminho acelerado com fallback silencioso em runner sem GPU). Ver detalhes e medições na seção de profundidade.
+
 ---
 
 ## 4. Estratégia de Desenvolvimento: Por que Otimizar o Runtime ANTES do Fine-Tuning?
