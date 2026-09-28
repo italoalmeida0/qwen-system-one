@@ -65,30 +65,13 @@ later requests only prefill the state suffix. Measured on Snapdragon X: sustaine
 probabilities (validated case-by-case). `--prefix-cache off` restores the exact single-pass
 path (bit-identical logits to the pinned reference; chunked logits differ by ~2e-5).
 
-### Hardware acceleration (opt-in, `--ep`)
+### Hardware: CPU only, by design
 
-The default build and the default `--ep cpu` keep today's CPU numerics exactly (the decision
-contract is bit-pinned). To trade that for GPU/NPU throughput, build with an acceleration
-feature and select the EP at run time:
-
-```bash
-# Windows (Snapdragon/Adreno GPU via DirectML):
-cargo build --release --features ep-directml --manifest-path native/qwen-serve/Cargo.toml
-./qwen-serve --ep dml        # or --ep auto (best effort, silent CPU fallback)
-
-# macOS (Neural Engine/GPU via CoreML):
-cargo build --release --features ep-coreml --manifest-path native/qwen-serve/Cargo.toml
-./qwen-serve --ep coreml
-
-# Android NNAPI (ep-nnapi) and Qualcomm Hexagon QNN (ep-qnn, needs QNN runtime
-# libs on PATH) are also compiled with their features.
-```
-
-`--ep auto` tries every accelerator compiled into the binary and silently falls back to CPU if
-none registers. An explicit name (`--ep dml`) fails hard instead of degrading — use it when you
-need to be sure the GPU/NPU path is active. Note that accelerated EPs compute in reduced
-precision/fused kernels: outputs can differ from CPU in the last decimals, so keep `--ep cpu`
-for the parity benchmarks.
+Execution providers (DirectML/CoreML/NNAPI/QNN) were implemented and measured — then removed
+after the real KV cache made the CPU path unbeatable on target hardware (129ms sustained, no
+thermal collapse vs 260-900ms+ on accelerators). The runtime is CPU-focused; measurements and
+the removed code live in ROADMAP / commit `32498d4` if Fase 2's smaller models ever change
+that calculus.
 
 ### 3. Send a System 1 Decision Request
 ```bash

@@ -28,12 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: 'linux-x64',   os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  out: linux-x64/qwen-serve, features: '' }
-          - { name: 'linux-arm64', os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, out: linux-arm64/qwen-serve, features: '' }
-          - { name: 'win32-x64',   os: windows-latest,   target: x86_64-pc-windows-msvc,    out: win32-x64/qwen-serve.exe, features: 'ep-directml' }
-          - { name: 'win32-arm64', os: windows-11-arm,   target: aarch64-pc-windows-msvc,   out: win32-arm64/qwen-serve.exe, features: 'ep-directml' }
-          - { name: 'darwin-arm64',os: macos-latest,     target: aarch64-apple-darwin,      out: darwin-arm64/qwen-serve, features: 'ep-coreml' }
-          - { name: 'darwin-x64',  os: macos-15-intel,   target: x86_64-apple-darwin,       out: darwin-x64/qwen-serve, features: 'ep-coreml' }
+          - { name: 'linux-x64',   os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  out: linux-x64/qwen-serve }
+          - { name: 'linux-arm64', os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, out: linux-arm64/qwen-serve }
+          - { name: 'win32-x64',   os: windows-latest,   target: x86_64-pc-windows-msvc,    out: win32-x64/qwen-serve.exe }
+          - { name: 'win32-arm64', os: windows-11-arm,   target: aarch64-pc-windows-msvc,   out: win32-arm64/qwen-serve.exe }
+          - { name: 'darwin-arm64',os: macos-latest,     target: aarch64-apple-darwin,      out: darwin-arm64/qwen-serve }
+          - { name: 'darwin-x64',  os: macos-15-intel,   target: x86_64-apple-darwin,       out: darwin-x64/qwen-serve }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,13 +60,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          EPF='${{ matrix.features }}'
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
             export ORT_LIB_PATH="$GITHUB_WORKSPACE/ort-libs"
             export ORT_PREFER_DYNAMIC_LINK=1
-            cargo build --release --no-default-features --features "mac-x64${EPF:+,$EPF}" --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
+            cargo build --release --no-default-features --features mac-x64 --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
           else
-            cargo build --release --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml ${EPF:+--features "$EPF"}
+            cargo build --release --target ${{ matrix.target }} --manifest-path native/qwen-serve/Cargo.toml
           fi
 
       - name: Stage into dist/bin/<slot>
@@ -105,14 +104,6 @@ jobs:
 
       - name: Prove the binary answers questions (10 questions)
         run: node tools/quick-check.js --binary 'dist/bin/${{ matrix.out }}'
-
-      # --ep auto registers every accelerator compiled into this build (DirectML
-      # on Windows, CoreML on macOS) and falls back to CPU silently if none is
-      # available on the runner (e.g. software display adapter). 2 cases only:
-      # this proves the accelerated path runs, it is not a perf benchmark.
-      - name: Smoke the accelerated EP (--ep auto, silent CPU fallback)
-        if: matrix.features != ''
-        run: node tools/quick-check.js --binary 'dist/bin/${{ matrix.out }}' --ep auto --cases 2 --port 8094
 
       - name: Concurrent throughput report (levels 1,2,4 + cache-hit)
         run: node tools/bench-concurrent.js --binary 'dist/bin/${{ matrix.out }}' --port 8099 --levels 1,2,4 --requests 6

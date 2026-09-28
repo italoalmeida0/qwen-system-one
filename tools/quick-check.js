@@ -23,9 +23,8 @@ const val = (name, def) => {
 
 const modelDir = path.resolve(ROOT, val('model', 'models'));
 const port = parseInt(val('port', '8093'), 10);
-// Optional --ep is forwarded to the spawned server (cpu|auto|dml|coreml|nnapi|qnn);
-// --cases N truncates the case list (for slow EP smoke runs on software adapters).
-const ep = val('ep', null);
+// --prefix-cache on|off is forwarded to the spawned server (KV real test);
+// --cases N truncates the case list (for fast smoke runs).
 const maxCases = parseInt(val('cases', '0'), 10);
 const prefixCache = val('prefix-cache', null);
 
@@ -95,7 +94,6 @@ async function main() {
   console.log(`[quick-check] port  : ${port}`);
 
   const child = spawn(binPath, ['--model-dir', modelDir, '--port', String(port), '--host', '127.0.0.1',
-    ...(ep ? ['--ep', ep] : []),
     ...(prefixCache ? ['--prefix-cache', prefixCache] : [])], {
     stdio: ['ignore', 'inherit', 'inherit']
   });
