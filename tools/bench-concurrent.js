@@ -6,6 +6,13 @@
  * bursts of concurrent /v1/systemone requests at several concurrency levels.
  * Reports per-level: throughput (req/s), p50/p95 latency, success rate.
  *
+ * Concurrency levels always run with cache-busted states (a nonce appended),
+ * so they measure REAL inference throughput. Repeated bodies would silently
+ * hit the exact cache and inflate req/s by ~1000x (that was happening before:
+ * "peak throughput 888 req/s" while true inference was ~1.2 req/s).
+ * The final cache-hit phase repeats one warm body on purpose to measure the
+ * cache ceiling.
+ *
  * Usage:
  *   node tools/bench-concurrent.js
  *   node tools/bench-concurrent.js --workers 2 --levels 1,2,4,8 --requests 16
@@ -93,13 +100,17 @@ function percentile(sorted, p) {
   return sorted[Math.max(0, idx)];
 }
 
-async function oneRequest(url, state) {
+let nonce = 0;
+
+async function oneRequest(url, state, unique = true) {
   const t0 = Date.now();
+  // Unique states guarantee a cache miss: every request runs real inference.
+  const body = { state: unique ? `${state} [bench-${++nonce}]` : state, questions: QUESTIONS };
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ state, questions: QUESTIONS }),
+      body: JSON.stringify(body),
     });
     const dur = Date.now() - t0;
     if (!res.ok) return { ok: false, dur };
@@ -111,7 +122,7 @@ async function oneRequest(url, state) {
   }
 }
 
-async function runLevel(url, concurrency, total, states = STATES) {
+async function runLevel(url, concurrency, total, states = STATES, unique = true) {
   const latencies = [];
   let ok = 0;
   let idx = 0;
@@ -121,7 +132,7 @@ async function runLevel(url, concurrency, total, states = STATES) {
     while (true) {
       const i = idx++;
       if (i >= total) return;
-      const r = await oneRequest(url, states[i % states.length]);
+      const r = await oneRequest(url, states[i % states.length], unique);
       latencies.push(r.dur);
       if (r.ok) ok++;
     }
@@ -175,10 +186,11 @@ async function main() {
 
     // Warmup: 2 sequential requests (page in weights, fill caches).
     console.log('[bench] warmup (2 sequential)...');
-    await oneRequest(apiUrl, STATES[0]);
-    await oneRequest(apiUrl, STATES[1]);
+    await oneRequest(apiUrl, STATES[0], false);
+    await oneRequest(apiUrl, STATES[1], false);
 
-    console.log(`\nconcurrency | ok/total | wall(ms) | req/s | p50(ms) | p95(ms) | max(ms)`);
+    console.log(`\n[bench] levels below are cache-busted: every request runs real inference`);
+    console.log(`concurrency | ok/total | wall(ms) | req/s | p50(ms) | p95(ms) | max(ms)`);
     console.log(`--------------------------------------------------------------------------------`);
     const rows = [];
     for (const c of levels) {
@@ -190,12 +202,12 @@ async function main() {
     }
     console.log(`--------------------------------------------------------------------------------`);
     const best = rows.reduce((a, b) => (parseFloat(b.rps) > parseFloat(a.rps) ? b : a), rows[0]);
-    console.log(`[bench] peak throughput: ${best.rps} req/s at concurrency ${best.concurrency}`);
+    console.log(`[bench] peak inference throughput: ${best.rps} req/s at concurrency ${best.concurrency}`);
 
-    // Cache-hit phase: repeat ONE state (already answered above) at high
+    // Cache-hit phase: repeat ONE warm body (answered during warmup) at high
     // concurrency. All should be exact-cache hits (~ms, no inference).
-    console.log(`\n[bench] cache-hit phase (repeat single state, expect ~ms)...`);
-    const hit = await runLevel(apiUrl, Math.max(...levels), perLevel, [STATES[0]]);
+    console.log(`\n[bench] cache-hit phase (repeat warm body, expect ~ms)...`);
+    const hit = await runLevel(apiUrl, Math.max(...levels), perLevel, [STATES[0]], false);
     console.log(
       `${String(`hit@${hit.concurrency}`).padStart(11)} | ${String(`${hit.ok}/${hit.total}`).padStart(8)} | ${String(hit.wallMs).padStart(8)} | ${String(hit.rps).padStart(5)} | ${String(hit.p50).padStart(7)} | ${String(hit.p95).padStart(7)} | ${String(hit.max).padStart(7)}`
     );

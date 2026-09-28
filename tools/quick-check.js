@@ -142,7 +142,7 @@ async function main() {
 
       const data = await res.json();
       const choice = data.answers?.department?.choice;
-      const prob = data.answers?.department?.probability || 0;
+      const prob = data.answers?.department?.probabilities?.[choice] || 0;
       responsesOk++;
       const isMatch = choice === expected;
 
@@ -155,6 +155,57 @@ async function main() {
     const avgLatency = (totalDur / latencies.length).toFixed(1);
     const rps = (1000 / (totalDur / latencies.length)).toFixed(2);
 
+    // Multi-question request: exercises the K>1 path (several questions in a
+    // single request). Every question must come back with a choice and a
+    // normalized probability distribution.
+    console.log(`\nRunning multi-question request (3 questions, 1 request):\n`);
+    const multiQs = {
+      department: QUESTIONS.department,
+      priority: {
+        type: 'choice',
+        instructions: 'How urgent is this request?',
+        criteria: {
+          low: 'can wait a few business days with no impact',
+          normal: 'should be handled this week',
+          high: 'blocks the customer right now and needs attention today',
+        },
+      },
+      sentiment: {
+        type: 'choice',
+        instructions: 'What is the customer sentiment?',
+        criteria: { calm: 'neutral or friendly tone', upset: 'angry, frustrated or disappointed' },
+      },
+    };
+    const multiStart = Date.now();
+    let multiOk = false;
+    try {
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state: CASES[0][0], questions: multiQs })
+      });
+      const multiDur = Date.now() - multiStart;
+      if (!res.ok) {
+        console.log(`[multi]  ❌ HTTP ERROR ${res.status}: ${await res.text()}`);
+      } else {
+        const data = await res.json();
+        const keys = Object.keys(multiQs);
+        const bad = keys.filter((k) => {
+          const a = data.answers?.[k];
+          if (!a?.choice) return true;
+          const sum = Object.values(a.probabilities || {}).reduce((x, y) => x + y, 0);
+          return Math.abs(sum - 1) > 0.01;
+        });
+        multiOk = bad.length === 0;
+        const summary = keys.map((k) => `${k}=${data.answers?.[k]?.choice}`).join(' ');
+        console.log(
+          `[multi]  ${multiOk ? '✔ OK' : '❌ INVALID'} | ${summary} | ${multiDur}ms`
+        );
+      }
+    } catch (err) {
+      console.log(`[multi]  ❌ REQUEST FAILED: ${err}`);
+    }
+
     console.log(`\n==================================================`);
     console.log(`Performance & Health Check Summary:`);
     console.log(`Successful Inferences: ${responsesOk}/${CASES.length}`);
@@ -166,6 +217,10 @@ async function main() {
 
     if (responsesOk === 0) {
       console.error(`[quick-check] FAILED: server did not produce valid inferences.`);
+      process.exit(1);
+    }
+    if (!multiOk) {
+      console.error(`[quick-check] FAILED: multi-question request did not return valid answers for all questions.`);
       process.exit(1);
     }
 
