@@ -70,6 +70,7 @@ def main():
 
     # 1. Carregar resultados anteriores para RETOMADA sem perdas
     completed_ids = set()
+    valid_lines = []
     if results_path.exists():
         print(f"[*] Verificando resultados anteriores em {results_path}...")
         with results_path.open("r", encoding="utf-8") as f:
@@ -79,9 +80,14 @@ def main():
                         rec = json.loads(line)
                         if rec.get("status") in ("ok", "unsupported", "abstained"):
                             completed_ids.add(rec["run_id"])
+                            valid_lines.append(line.strip() + "\n")
                     except Exception:
                         pass
-        print(f"[*] Encontradas {len(completed_ids):,} questoes ja concluidas! Pulando-as...")
+        # Limpar registros com erro para reprocessá-los corretamente
+        with results_path.open("w", encoding="utf-8") as f:
+            for vl in valid_lines:
+                f.write(vl)
+        print(f"[*] Encontradas {len(completed_ids):,} questoes validas ja concluidas! Pulando-as...")
 
     # 2. Carregar todas as questões da suite
     print(f"[*] Carregando questoes de: {args.rows}...")

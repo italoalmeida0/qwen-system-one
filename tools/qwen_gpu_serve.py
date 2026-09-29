@@ -54,12 +54,16 @@ def render_question(state, qdef):
     
     if qtype == "choice":
         keys = list(criteria.keys())
+        if len(keys) > 26:
+            raise ValueError(f"question has {len(keys)} options, which exceeds the limit of 26 options per choice")
         texts = [f"{k}: {render_value(v)}" if v is not None else k for k, v in criteria.items()]
     elif qtype == "noul":
         keys = ["false", "true"]
         texts = [f"No: {criteria.get('false', 'no')}", f"Yes: {criteria.get('true', 'yes')}"]
     elif qtype == "score":
         crit_arr = criteria if isinstance(criteria, list) else list(criteria.values())
+        if len(crit_arr) > 26:
+            raise ValueError(f"score question has {len(crit_arr)} options, which exceeds the limit of 26 options per choice")
         keys = [str(i) for i in range(len(crit_arr))]
         texts = [f"{i}: {render_value(v)}" for i, v in enumerate(crit_arr)]
     else:
@@ -109,13 +113,21 @@ def systemone(body: dict):
     prompts = []
     keys_list = []
     qtypes = []
-    for qid in qids:
-        qdef = questions[qid]
-        qtype = qdef.get("type", "choice")
-        prompt, keys = render_question(state, qdef)
-        prompts.append(prompt)
-        keys_list.append(keys)
-        qtypes.append(qtype)
+    try:
+        for qid in qids:
+            qdef = questions[qid]
+            qtype = qdef.get("type", "choice")
+            prompt, keys = render_question(state, qdef)
+            prompts.append(prompt)
+            keys_list.append(keys)
+            qtypes.append(qtype)
+    except ValueError as ve:
+        if "options per choice" in str(ve):
+            return JSONResponse(
+                status_code=422,
+                content={"error": str(ve)}
+            )
+        raise
         
     answers = {}
     
