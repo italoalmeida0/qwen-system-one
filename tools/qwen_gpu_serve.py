@@ -53,8 +53,8 @@ def render_question(state, qdef):
         keys = list(criteria.keys())
         texts = [f"{k}: {render_value(v)}" if v is not None else k for k, v in criteria.items()]
     elif qtype == "noul":
-        keys = ["true", "false"]
-        texts = [f"Yes: {criteria.get('true', 'yes')}", f"No: {criteria.get('false', 'no')}"]
+        keys = ["false", "true"]
+        texts = [f"No: {criteria.get('false', 'no')}", f"Yes: {criteria.get('true', 'yes')}"]
     elif qtype == "score":
         crit_arr = criteria if isinstance(criteria, list) else list(criteria.values())
         keys = [str(i) for i in range(len(crit_arr))]
@@ -91,6 +91,7 @@ def health():
 
 import threading
 gpu_lock = threading.Lock()
+MAX_CONTEXT = 32768
 
 @app.post("/v1/systemone")
 def systemone(body: dict):
@@ -99,12 +100,23 @@ def systemone(body: dict):
     
     answers = {}
     for qid, qdef in questions.items():
+        qtype = qdef.get("type", "choice")
         prompt, keys = render_question(state, qdef)
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
         
+        seq_len = inputs["input_ids"].shape[1]
+        if seq_len > MAX_CONTEXT:
+            return JSONResponse(
+                status_code=422,
+                content={"error": f"prompt length {seq_len} exceeds maximum context length {MAX_CONTEXT}"}
+            )
+        
         with gpu_lock:
             with torch.no_grad():
-                out = model(**inputs)
+                try:
+                    out = model(**inputs, logits_to_keep=1)
+                except TypeError:
+                    out = model(**inputs)
                 logits = out.logits[0, -1] # último token da sequência
                 
                 k = len(keys)
@@ -123,12 +135,19 @@ def systemone(body: dict):
         if s > 0:
             prob_dict = {k: v / s for k, v in prob_dict.items()}
             
-        answers[qid] = {
-            "type": qdef.get("type", "choice"),
-            "choice": choice_key,
-            "probabilities": prob_dict,
-            "confidence": float(probs_t[choice_idx])
-        }
+        if qtype == "noul":
+            true_idx = keys.index("true")
+            answers[qid] = {
+                "type": "noul",
+                "noul": float(prob_dict["true"])
+            }
+        else:
+            answers[qid] = {
+                "type": qtype,
+                "choice": choice_key,
+                "probabilities": prob_dict,
+                "confidence": float(probs_t[choice_idx])
+            }
         
     return {
         "model": body.get("model", "qwen-system-one"),
