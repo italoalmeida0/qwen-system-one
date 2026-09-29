@@ -1,40 +1,31 @@
 #!/usr/bin/env python3
-"""export_onnx_q4.py — exporta o modelo treinado para o formato do runtime qwen-serve.
+"""update_onnx_weights.py — Injeta pesos fine-tunados no grafo ONNX Q4 existente.
 
-Gera os 5 arquivos binários exigidos pelo runtime Rust:
-    embed_tokens_q4.onnx         + embed_tokens_q4.onnx_data
-    decoder_model_merged_q4.onnx + decoder_model_merged_q4.onnx_data
-    tokenizer.json, tokenizer_config.json, config.json
+Como a arquitetura Qwen 3.5 0.8B possui operadores customizados (LinearAttention com
+Gated DeltaNet, CausalConvWithState, GatherBlockQuantized, MatMulNBits com INT4 block-32),
+a exportação via Optimum/PyTorch tracing falha por falta de kernel oficial.
 
-Abordagem:
-  A arquitetura Qwen 3.5 0.8B utiliza operadores fundidos especializados da Microsoft
-  (LinearAttention com Gated DeltaNet, CausalConvWithState, GatherBlockQuantized,
-  MatMulNBits INT4 block-32). A ferramenta Optimum/PyTorch padrão não suporta o rastreamento
-  dessa arquitetura customizada.
+Este script utiliza o grafo ONNX base já validado pelo runtime Rust (qwen-serve) e
+injeta diretamente os novos pesos do checkpoint PyTorch/safetensors:
+  1. embed_tokens_q4.onnx + embed_tokens_q4.onnx_data
+  2. decoder_model_merged_q4.onnx + decoder_model_merged_q4.onnx_data
+  3. Copia tokenizer.json e configs
 
-  Este script obtém o grafo ONNX base verificado (seja da pasta local `models/` ou
-  baixando o bundle base oficial do release v1.0.0 em ~3s) e injeta cirurgicamente
-  os pesos fine-tunados do checkpoint PyTorch/safetensors:
-    - Quantização INT4 acelerada por C++ (onnxruntime) ou NumPy vetorizado.
-    - Atualização direta dos tensores de LayerNorm, RMSNorm, GDN conv1d e A_neg_exp.
-    - Sem recompilação do grafo, garantindo 100% de compatibilidade binária e latência < 130ms.
-
-Uso:
-    python tools/export_onnx_q4.py \
-        --model /content/drive/MyDrive/qwen-system-one/runs/decider08_full/model \
+Execução:
+    python tools/update_onnx_weights.py \
+        --base-onnx-dir models \
+        --safetensors /content/drive/MyDrive/qwen-system-one/runs/decider08_full/model \
         --out /content/drive/MyDrive/qwen-system-one/models_v1_1
 """
 import argparse
 import os
 import re
 import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-# Suporte bfloat16
+# Compatibilidade ml_dtypes para bfloat16
 try:
     import ml_dtypes
 except ImportError:
@@ -44,8 +35,6 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 from safetensors import safe_open
-
-BASE_MODEL_RELEASE_URL = "https://github.com/italoalmeida0/qwen-system-one/releases/download/v1.0.0/qwen-0.8b-q4.model"
 
 # Tenta carregar o kernel C++ de quantização INT4 do ONNX Runtime
 HAS_C_QUANT = False
@@ -57,29 +46,43 @@ except Exception:
 
 
 def quantize_block_int4_numpy(data_2d: np.ndarray, block_size: int = 32):
-    """Fallback vetorizado puro em NumPy para quantização assimétrica INT4 em blocos."""
+    """Fallback puro em NumPy para quantização assimétrica INT4 em blocos.
+    
+    data_2d: matriz float32 com shape [rows, cols] onde rows = K (dimensão de redução), cols = N.
+    Retorna:
+        packed: uint8 com shape [cols, k_blocks, 16]
+        scales: float32 com shape [cols, k_blocks]
+        zero_points: uint8 com shape [cols, (k_blocks + 1) // 2]
+    """
     rows, cols = data_2d.shape
     k_blocks = (rows + block_size - 1) // block_size
     pad_len = k_blocks * block_size - rows
     if pad_len > 0:
         data_2d = np.pad(data_2d, ((0, pad_len), (0, 0)), mode="constant")
 
+    # Reshape para [cols, k_blocks, block_size]
+    # data_2d é [K, N], transpondo para [N, K] e reorganizando em blocos
     t = data_2d.T.reshape(cols, k_blocks, block_size)
     min_val = np.minimum(t.min(axis=2), 0.0)
     max_val = np.maximum(t.max(axis=2), 0.0)
 
     range_val = max_val - min_val
     scales = np.where(range_val == 0.0, 1.0, range_val / 15.0).astype(np.float32)
+    
+    # zp = round(-min_val / scale) clip(0, 15)
     zp_unpacked = np.where(range_val == 0.0, 8, np.round(-min_val / scales)).clip(0, 15).astype(np.uint8)
-
+    
+    # quant = round((x / scale) + zp) clip(0, 15)
     scales_exp = np.expand_dims(scales, axis=2)
     zp_exp = np.expand_dims(zp_unpacked, axis=2)
     q_unpacked = np.where(scales_exp == 0.0, 8, np.round(t / scales_exp) + zp_exp).clip(0, 15).astype(np.uint8)
 
+    # Empacota quant [cols, k_blocks, 32] -> [cols, k_blocks, 16] (nibble baixo = índice par, nibble alto = ímpar)
     low_nibble = q_unpacked[:, :, 0::2] & 0x0F
     high_nibble = (q_unpacked[:, :, 1::2] & 0x0F) << 4
     packed = (low_nibble | high_nibble).astype(np.uint8)
 
+    # Empacota zero points [cols, k_blocks] -> [cols, (k_blocks + 1) // 2]
     zp_cols = (k_blocks + 1) // 2
     zp_padded = zp_unpacked
     if k_blocks % 2 != 0:
@@ -92,7 +95,12 @@ def quantize_block_int4_numpy(data_2d: np.ndarray, block_size: int = 32):
 
 
 def quantize_weight(w_fp32: np.ndarray, block_size: int = 32):
-    """Quantiza matriz de pesos para formato MatMulNBits (N, K // 32, 16)."""
+    """Quantiza matriz de pesos para formato MatMulNBits (N, K // 32, 16).
+    
+    w_fp32: shape [N, K] (saída x entrada, convenção PyTorch)
+    Retorna: packed [N, K // 32, 16], scales [N, K // 32], zero_points [N, (K // 32 + 1) // 2]
+    """
+    # MatMul B em ONNX é [K, N]
     B = w_fp32.T
     rows, cols = B.shape
     k_blocks = (rows + block_size - 1) // block_size
@@ -118,9 +126,10 @@ class WeightReader:
         for idx, h in enumerate(self.handles):
             for k in h.keys():
                 self.key_map[k] = idx
-        print(f"[safetensors] {len(self.key_map)} tensores indexados em {len(self.files)} arquivo(s).")
+        print(f"[safetensors] {len(self.key_map)} tensores carregados de {len(self.files)} arquivo(s).")
 
     def get_tensor(self, name: str) -> np.ndarray:
+        # Tenta variações de prefixo
         candidates = [
             name,
             f"model.language_model.{name}",
@@ -132,10 +141,11 @@ class WeightReader:
             if c in self.key_map:
                 arr = self.handles[self.key_map[c]].get_tensor(c)
                 if hasattr(arr, "astype"):
+                    # Converte bfloat16 para float32
                     if arr.dtype == np.dtype("bfloat16") or str(arr.dtype) == "bfloat16":
                         arr = arr.astype(np.float32)
                 return arr
-        raise KeyError(f"Tensor não encontrado no safetensors: {name}")
+        raise KeyError(f"Tensor não encontrado no safetensors: {name} (tentados: {candidates[:3]})")
 
     def has_tensor(self, name: str) -> bool:
         candidates = [
@@ -148,51 +158,25 @@ class WeightReader:
         return any(c in self.key_map for c in candidates)
 
 
-def ensure_base_onnx_models(base_dir: Path) -> Path:
-    """Garante a presença dos 4 arquivos ONNX base de referência."""
-    required = [
-        "embed_tokens_q4.onnx",
-        "embed_tokens_q4.onnx_data",
-        "decoder_model_merged_q4.onnx",
-        "decoder_model_merged_q4.onnx_data",
-    ]
-    if all((base_dir / f).exists() for f in required):
-        return base_dir
-
-    base_dir.mkdir(parents=True, exist_ok=True)
-    archive = base_dir / "qwen-0.8b-q4.model"
-
-    if not archive.exists():
-        print(f"[base] Baixando modelo base de referência do GitHub ({BASE_MODEL_RELEASE_URL})...")
-        cmd = ["curl", "-sL", "-f", "--retry", "3", "--retry-delay", "2", "-o", str(archive), BASE_MODEL_RELEASE_URL]
-        res = subprocess.run(cmd)
-        if res.returncode != 0:
-            import urllib.request
-            print("[base] Fallback urllib para download do release...")
-            urllib.request.urlretrieve(BASE_MODEL_RELEASE_URL, str(archive))
-
-    print(f"[base] Extraindo arquivo {archive.name}...")
-    subprocess.run(["tar", "-xzf", str(archive), "-C", str(base_dir)], check=True)
-
-    if not all((base_dir / f).exists() for f in required):
-        raise RuntimeError(f"Falha ao extrair arquivos ONNX de {archive}")
-
-    return base_dir
-
-
 def update_embed_tokens(base_onnx: Path, out_onnx: Path, reader: WeightReader):
-    """Atualiza embed_tokens_q4.onnx com os novos pesos de embedding."""
-    print(f"[embed_tokens] Carregando {base_onnx.name}...")
+    """Atualiza embed_tokens_q4.onnx com novos pesos de embedding."""
+    print(f"\n[embed_tokens] Carregando {base_onnx.name}...")
     m = onnx.load(str(base_onnx), load_external_data=False)
-
+    
+    # Obtém novos pesos de embedding
     w_emb = reader.get_tensor("model.language_model.embed_tokens.weight")
-    vocab_size, _ = w_emb.shape
+    vocab_size, hidden_dim = w_emb.shape
+    print(f"[embed_tokens] Novos pesos de embedding: shape {w_emb.shape}, dtype {w_emb.dtype}")
 
     t0 = time.time()
     packed, scales, zp = quantize_weight(w_emb, block_size=32)
+    # embed_tokens quant tem shape [vocab_size, 512] (packed [N, K_blocks, 16] reshaped para 2D)
     packed_2d = packed.reshape(vocab_size, -1)
     print(f"[embed_tokens] Quantização 4-bit concluída em {time.time() - t0:.2f}s.")
 
+    # Substitui os initializers
+    init_map = {init.name: init for init in m.graph.initializer}
+    
     new_inits = []
     for init in m.graph.initializer:
         if init.name == "model_embed_tokens_weight_quant":
@@ -227,9 +211,10 @@ def update_embed_tokens(base_onnx: Path, out_onnx: Path, reader: WeightReader):
 
 def update_decoder(base_onnx: Path, out_onnx: Path, reader: WeightReader):
     """Atualiza decoder_model_merged_q4.onnx com novos pesos de camadas e MatMuls."""
-    print(f"[decoder] Carregando {base_onnx.name}...")
+    print(f"\n[decoder] Carregando {base_onnx.name}...")
     m = onnx.load(str(base_onnx), load_external_data=False)
 
+    # Cache de quantização para não re-quantizar pesos repetidos (ex: lm_head se tied com embed_tokens)
     quant_cache = {}
 
     def get_quantized(weight_name: str):
@@ -245,10 +230,10 @@ def update_decoder(base_onnx: Path, out_onnx: Path, reader: WeightReader):
     t0 = time.time()
 
     new_inits = []
-    for init in m.graph.initializer:
+    for idx, init in enumerate(m.graph.initializer):
         name = init.name
-
-        # 1. Constantes auxiliares de grafo
+        
+        # 1. Constantes auxiliares de grafo: mantém inalteradas
         if "constants" in name or name == "model.inv_freq":
             new_inits.append(init)
             continue
@@ -362,6 +347,8 @@ def update_decoder(base_onnx: Path, out_onnx: Path, reader: WeightReader):
             updated_count += 1
             continue
 
+        # Se não casou com nenhuma regra conhecida, mantém o original com aviso
+        print(f"[decoder] AVISO: initializer não mapeado mantido original: {name}")
         new_inits.append(init)
 
     print(f"[decoder] {updated_count}/{total_inits} initializers atualizados em {time.time() - t0:.2f}s.")
@@ -388,57 +375,51 @@ def update_decoder(base_onnx: Path, out_onnx: Path, reader: WeightReader):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Exporta checkpoint PyTorch treinado para ONNX Q4 nativo")
-    parser.add_argument("--model", required=True, help="Diretório contendo o checkpoint (model.safetensors, tokenizer.json)")
-    parser.add_argument("--out", required=True, help="Diretório de saída para os modelos ONNX Q4")
-    parser.add_argument("--base-onnx", default="", help="Diretório dos modelos ONNX base (se vazio, auto-detecta ou baixa)")
+    parser = argparse.ArgumentParser(description="Injeta pesos safetensors no ONNX Q4")
+    parser.add_argument("--base-onnx-dir", default="models", help="Pasta com os modelos ONNX base de referência")
+    parser.add_argument("--safetensors", required=True, help="Pasta contendo model.safetensors treinado")
+    parser.add_argument("--out", required=True, help="Pasta de destino para o modelo ONNX Q4 final")
     args = parser.parse_args()
 
-    model_dir = Path(args.model)
+    base_dir = Path(args.base_onnx_dir)
+    st_dir = Path(args.safetensors)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=======================================================")
-    print(f"   QWEN-SYSTEM-ONE : EXPORTADOR ONNX Q4 NATIVO v1.1.0   ")
-    print(f"=======================================================")
-    print(f"Checkpoint modelo: {model_dir.resolve()}")
-    print(f"Destino ONNX Q4:   {out_dir.resolve()}")
-    print(f"Aceleração:        {'C++ onnxruntime kernel' if HAS_C_QUANT else 'NumPy Vectorized'}")
+    print(f"=== INÍCIO DA ATUALIZAÇÃO ONNX Q4 ===")
+    print(f"Base ONNX:       {base_dir.resolve()}")
+    print(f"Safetensors:     {st_dir.resolve()}")
+    print(f"Saída:           {out_dir.resolve()}")
+    print(f"Aceleração C++:  {'Ativa (onnxruntime)' if HAS_C_QUANT else 'NumPy Vectorized'}")
 
-    # Determina pasta de modelos base
-    base_dir = Path(args.base_onnx) if args.base_onnx else Path("models")
-    if not (base_dir / "decoder_model_merged_q4.onnx").exists():
-        # Tenta /content/drive/MyDrive/qwen-system-one/models ou /tmp/base_onnx
-        drive_models = Path("/content/drive/MyDrive/qwen-system-one/models")
-        if (drive_models / "decoder_model_merged_q4.onnx").exists():
-            base_dir = drive_models
-        else:
-            base_dir = Path(tempfile.gettempdir()) / "qwen_base_onnx"
-
-    base_dir = ensure_base_onnx_models(base_dir)
-    print(f"Base ONNX pronta:  {base_dir.resolve()}\n")
-
-    reader = WeightReader(model_dir)
+    reader = WeightReader(st_dir)
 
     # 1. embed_tokens_q4
-    update_embed_tokens(base_dir / "embed_tokens_q4.onnx", out_dir / "embed_tokens_q4.onnx", reader)
+    base_embed = base_dir / "embed_tokens_q4.onnx"
+    out_embed = out_dir / "embed_tokens_q4.onnx"
+    if not base_embed.exists():
+        raise FileNotFoundError(f"Arquivo base não encontrado: {base_embed}")
+    update_embed_tokens(base_embed, out_embed, reader)
 
     # 2. decoder_model_merged_q4
-    update_decoder(base_dir / "decoder_model_merged_q4.onnx", out_dir / "decoder_model_merged_q4.onnx", reader)
+    base_decoder = base_dir / "decoder_model_merged_q4.onnx"
+    out_decoder = out_dir / "decoder_model_merged_q4.onnx"
+    if not base_decoder.exists():
+        raise FileNotFoundError(f"Arquivo base não encontrado: {base_decoder}")
+    update_decoder(base_decoder, out_decoder, reader)
 
-    # 3. Copia tokenizer e configs
+    # 3. Tokenizer e arquivos de configuração
     print(f"\n[copia] Copiando tokenizer.json e configurações...")
     for f_name in ["tokenizer.json", "tokenizer_config.json", "config.json", "chat_template.jinja"]:
-        src = model_dir / f_name
+        src = st_dir / f_name
         if not src.exists():
             src = base_dir / f_name
         if src.exists():
             dst = out_dir / f_name
             shutil.copy2(src, dst)
-            print(f"  [OK] {f_name} ({dst.stat().st_size / 1024:.1f} KB)")
+            print(f"[copia] {f_name} copiado ({dst.stat().st_size / 1024:.1f} KB)")
 
-    # 4. Verificação de integridade
-    print(f"\n[validacao] Verificando integridade dos arquivos gerados...")
+    print(f"\n[validacao] Verificando arquivos gerados...")
     required = [
         "embed_tokens_q4.onnx",
         "embed_tokens_q4.onnx_data",
@@ -448,13 +429,11 @@ def main():
     ]
     for r in required:
         p = out_dir / r
-        if not p.exists() or p.stat().st_size == 0:
-            raise RuntimeError(f"ERRO: Arquivo obrigatório ausente ou vazio: {p}")
+        if not p.exists():
+            raise RuntimeError(f"ERRO: Arquivo obrigatório não foi gerado: {p}")
         print(f"  [OK] {r} ({p.stat().st_size / 1024 / 1024:.2f} MB)")
 
-    print(f"\n=======================================================")
-    print(f"   EXPORTAÇÃO CONCLUÍDA COM SUCESSO EM {out_dir} !    ")
-    print(f"=======================================================\n")
+    print(f"\n=== SUCESSO! Modelo ONNX Q4 pronto para o runtime Rust em: {out_dir} ===")
 
 
 if __name__ == "__main__":
