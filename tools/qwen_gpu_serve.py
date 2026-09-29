@@ -89,9 +89,11 @@ def health():
         "runtime": "pytorch-cuda-bfloat16-sdpa"
     }
 
+import threading
+gpu_lock = threading.Lock()
+
 @app.post("/v1/systemone")
-async def systemone(request: Request):
-    body = await request.json()
+def systemone(body: dict):
     state = body.get("state")
     questions = body.get("questions", {})
     
@@ -100,33 +102,34 @@ async def systemone(request: Request):
         prompt, keys = render_question(state, qdef)
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
         
-        with torch.no_grad():
-            out = model(**inputs)
-            logits = out.logits[0, -1] # último token da sequência
-            
-            k = len(keys)
-            target_ids = LABEL_TOKEN_IDS[:k]
-            label_logits = logits[target_ids]
-            
-            # Softmax com a temperatura calibrada
-            probs_t = torch.softmax(label_logits / TEMPERATURE, dim=-1).cpu().tolist()
-            
-            choice_idx = max(range(k), key=lambda i: probs_t[i])
-            choice_key = keys[choice_idx]
-            
-            prob_dict = {keys[i]: float(probs_t[i]) for i in range(k)}
-            # Normalizar para garantir soma exata = 1.0 (evita arredondamento de float)
-            s = sum(prob_dict.values())
-            if s > 0:
-                prob_dict = {k: v / s for k, v in prob_dict.items()}
+        with gpu_lock:
+            with torch.no_grad():
+                out = model(**inputs)
+                logits = out.logits[0, -1] # último token da sequência
                 
-            answers[qid] = {
-                "type": qdef.get("type", "choice"),
-                "choice": choice_key,
-                "probabilities": prob_dict,
-                "confidence": float(probs_t[choice_idx])
-            }
+                k = len(keys)
+                target_ids = LABEL_TOKEN_IDS[:k]
+                label_logits = logits[target_ids]
+                
+                # Softmax com a temperatura calibrada
+                probs_t = torch.softmax(label_logits / TEMPERATURE, dim=-1).cpu().tolist()
+                
+        choice_idx = max(range(k), key=lambda i: probs_t[i])
+        choice_key = keys[choice_idx]
+        
+        prob_dict = {keys[i]: float(probs_t[i]) for i in range(k)}
+        # Normalizar para garantir soma exata = 1.0 (evita arredondamento de float)
+        s = sum(prob_dict.values())
+        if s > 0:
+            prob_dict = {k: v / s for k, v in prob_dict.items()}
             
+        answers[qid] = {
+            "type": qdef.get("type", "choice"),
+            "choice": choice_key,
+            "probabilities": prob_dict,
+            "confidence": float(probs_t[choice_idx])
+        }
+        
     return {
         "model": body.get("model", "qwen-system-one"),
         "answers": answers
