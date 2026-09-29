@@ -242,52 +242,103 @@ def quantize_to_q4(in_onnx: Path, out_onnx: Path, block_size: int = 32):
     print(f"[quant] OK {out_onnx.name} ({sz_onnx:.1f} KB, data: {sz_data:.1f} MB)")
 
 
-def export_base_onnx(model_dir: Path, temp_dir: Path, task: str = "image-text-to-text"):
+def export_base_onnx(model_dir: Path, temp_dir: Path, task: str = "auto"):
     """Exporta o modelo PyTorch/safetensors para ONNX FP32 via optimum."""
     print(f"[export] exportando modelo de {model_dir} para {temp_dir}...")
 
-    # Tentativa 1: Python API direta do Optimum
+    # Garante que o TasksManager reconheça qwen3_5_text / qwen3_5
     try:
-        from optimum.exporters.onnx import main_export
-        print(f"[export] executando optimum.exporters.onnx.main_export (task={task})...")
-        main_export(
-            model_name_or_path=str(model_dir),
-            output=str(temp_dir),
-            task=task,
-            do_validation=False,
-            trust_remote_code=True,
-            device="cpu",
-        )
-        print("[export] export via Python API concluído!")
-        return
-    except Exception as e:
-        print(f"[export] main_export Python API falhou ({e}). Tentando fallback CLI...")
+        from optimum.exporters.tasks import TasksManager
+        supported = TasksManager._SUPPORTED_MODEL_TYPE
+        if "qwen3_5_text" not in supported:
+            for ref in ["qwen3_5", "qwen2", "qwen2_5", "llama"]:
+                if ref in supported:
+                    supported["qwen3_5_text"] = supported[ref]
+                    print(f"[optimum] TasksManager alias registrado: qwen3_5_text -> {ref}")
+                    break
+        if "qwen3_5" not in supported:
+            for ref in ["qwen2_5_vl", "qwen2_vl", "qwen2", "llama"]:
+                if ref in supported:
+                    supported["qwen3_5"] = supported[ref]
+                    print(f"[optimum] TasksManager alias registrado: qwen3_5 -> {ref}")
+                    break
+    except Exception:
+        pass
 
-    # Tentativa 2: CLI optimum-cli
-    cli = shutil.which("optimum-cli")
-    if cli:
-        cmd = [cli, "export", "onnx", "--model", str(model_dir), "--task", task, "--trust-remote-code", str(temp_dir)]
+    # Determina a ordem de tasks a tentar
+    if task and task != "auto":
+        tasks = [task]
     else:
-        cmd = [
-            sys.executable, "-m", "optimum.commands.optimum_cli",
-            "export", "onnx",
-            "--model", str(model_dir),
-            "--task", task,
-            "--trust-remote-code",
-            str(temp_dir),
-        ]
+        cfg_path = model_dir / "config.json"
+        is_text_only = True
+        if cfg_path.exists():
+            try:
+                import json
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                mtype = cfg.get("model_type", "")
+                arch = cfg.get("architectures", [""])[0]
+                if mtype == "qwen3_5" and "ConditionalGeneration" in arch:
+                    is_text_only = False
+            except Exception:
+                pass
 
-    print(f"[export] rodando: {' '.join(cmd)}")
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        raise RuntimeError(f"optimum export falhou com código de retorno {r.returncode}")
+        if is_text_only:
+            tasks = ["text-generation-with-past", "text-generation", "image-text-to-text"]
+        else:
+            tasks = ["image-text-to-text", "text-generation-with-past", "text-generation"]
+
+    last_error = None
+    for cur_task in tasks:
+        print(f"\n[export] Tentando export com task='{cur_task}'...")
+        # Tentativa 1: Python API direta do Optimum
+        try:
+            from optimum.exporters.onnx import main_export
+            print(f"[export] executando optimum.exporters.onnx.main_export (task={cur_task})...")
+            main_export(
+                model_name_or_path=str(model_dir),
+                output=str(temp_dir),
+                task=cur_task,
+                do_validation=False,
+                trust_remote_code=True,
+                device="cpu",
+            )
+            print(f"[export] export via Python API concluído com task='{cur_task}'!")
+            return
+        except Exception as e:
+            print(f"[export] main_export com task='{cur_task}' falhou ({e}). Tentando fallback CLI...")
+            last_error = e
+
+        # Tentativa 2: CLI optimum-cli
+        cli = shutil.which("optimum-cli")
+        if cli:
+            cmd = [cli, "export", "onnx", "--model", str(model_dir), "--task", cur_task, "--trust-remote-code", str(temp_dir)]
+        else:
+            cmd = [
+                sys.executable, "-m", "optimum.commands.optimum_cli",
+                "export", "onnx",
+                "--model", str(model_dir),
+                "--task", cur_task,
+                "--trust-remote-code",
+                str(temp_dir),
+            ]
+
+        print(f"[export] rodando: {' '.join(cmd)}")
+        r = subprocess.run(cmd)
+        if r.returncode == 0:
+            print(f"[export] optimum-cli concluído com sucesso com task='{cur_task}'!")
+            return
+        else:
+            print(f"[export] optimum-cli falhou com código {r.returncode} para task='{cur_task}'")
+
+    raise RuntimeError(f"Todas as tentativas de export ONNX falharam. Último erro: {last_error}")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Exporta modelo treinado para ONNX Q4 compatível com qwen-serve")
     ap.add_argument("--model", required=True, help="pasta do modelo treinado (safetensors)")
     ap.add_argument("--out", required=True, help="pasta de saída dos .onnx")
-    ap.add_argument("--task", default="image-text-to-text", help="task do optimum (padrão: image-text-to-text)")
+    ap.add_argument("--task", default="auto", help="task do optimum (padrão: auto: detecta texto ou multimodal)")
     ap.add_argument("--block-size", type=int, default=32, help="tamanho do bloco na quantização INT4 (padrão: 32)")
     ap.add_argument("--keep-temp", action="store_true", help="mantém pasta temporária de exportação FP32")
     args = ap.parse_args()
@@ -321,6 +372,8 @@ def main():
         decoder_candidates = [
             temp_dir / "decoder_model_merged.onnx",
             temp_dir / "onnx" / "decoder_model_merged.onnx",
+            temp_dir / "decoder_with_past_model.onnx",
+            temp_dir / "onnx" / "decoder_with_past_model.onnx",
             temp_dir / "decoder_model.onnx",
             temp_dir / "onnx" / "decoder_model.onnx",
             temp_dir / "model.onnx",
