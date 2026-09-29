@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""export_onnx_q4.py — exporta o modelo treinado para o formato do runtime qwen-serve.
+"""export_onnx_q4.py — exporta o modelo treinado pro formato do runtime qwen-serve.
 
-Saída (mesmos nomes/IO do runtime — verificado em models/decoder_model_merged_q4.onnx):
+Caminho: `optimum-cli` (padrão HF, mesmo usado pelo onnx-community/Qwen3.5-0.8B-ONNX-OPT).
+
+Saída (mesmo layout do repo de referência):
     embed_tokens_q4.onnx         + embed_tokens_q4.onnx_data
     decoder_model_merged_q4.onnx + decoder_model_merged_q4.onnx_data
+    (vision_encoder_q4.onnx ignorado — nosso modelo é texto-only)
 
 Uso (Colab, célula 6):
-    python export_onnx_q4.py --model $OUT/model --out /content/drive/MyDrive/qwen-system-one/models_v1_1
+    python export_onnx_q4.py --model $OUT/model --out $GROOT/models_v1_1
 
-Pipeline (padrão HF optimum + quant block-wise):
-1. `optimum.onnxruntime` exporta o modelo com KV cache (past_*/present_*).
-2. Separa embed (lookup) do decoder (merged).
-3. Quantiza pesos INT4 block-wise (group_size=32) via onnxruntime.quantization.
-4. Salva com external data (.onnx grafo + .onnx_data pesos) — formato do runtime.
-
-ATENÇÃO: o export do Qwen3.5 (arquitetura híbrida DeltaNet+attention) pode exigir
-opset/customização extra. Se optimum reclamar de ops, usar o exportador do
-onnx-community/Qwen3.5-0.8B-ONNX-OPT como referência (mesma arquitetura, mesmo
-layout de past_*/present_*).
+O optimum-cli gera as variantes (fp32, fp16, q4, q4f16) automaticamente com
+`--optimize O2`. Aqui mantemos só as q4 (formato do runtime).
 """
 import argparse
-import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -29,57 +25,59 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="pasta do modelo treinado (safetensors)")
     ap.add_argument("--out", required=True, help="pasta de saída dos .onnx")
-    ap.add_argument("--quant", default="q4", choices=["q4", "fp16"])
-    ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--task", default="image-text-to-text", help="task do optimum (mesma do repo de referência)")
+    ap.add_argument("--optimize", default="O2", help="nível de otimização/quant do optimum")
     args = ap.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    model = Path(args.model)
     out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1. Exporta com optimum (KV cache: past_*/present_*) ----
-    print(f"[export] optimum exportando {args.model} -> {args.out}")
-    from optimum.onnxruntime import ORTModelForCausalLM
-    from transformers import AutoTokenizer
+    # ---- 1. Exporta com optimum-cli (gera embed_tokens + decoder_model_merged + vision_encoder) ----
+    cmd = [
+        sys.executable, "-m", "optimum", "onnxruntime", "export", "onnx",
+        "--model", str(model),
+        "--task", args.task,
+        "--optimize", args.optimize,
+        "--trust-remote-code",
+        str(out),
+    ]
+    print(f"[export] rodando: {' '.join(cmd)}")
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print("[export] optimum-cli falhou (arquitetura híbrida DeltaNet pode exigir opset extra).")
+        print("[export] fallback: usar o exportador do onnx-community/Qwen3.5-0.8B-ONNX-OPT como referência.")
+        sys.exit(1)
 
-    tok = AutoTokenizer.from_pretrained(args.model)
-    model = ORTModelForCausalLM.from_pretrained(args.model, export=True)
-    model.save_pretrained(out)
-    tok.save_pretrained(out)
+    # ---- 2. Mantém só as variantes q4 (formato do runtime) ----
+    keep = {"embed_tokens_q4.onnx", "embed_tokens_q4.onnx_data",
+            "decoder_model_merged_q4.onnx", "decoder_model_merged_q4.onnx_data",
+            "tokenizer.json", "tokenizer_config.json", "config.json"}
+    for p in sorted(out.iterdir()):
+        if p.name not in keep:
+            # remove fp32/fp16/q4f16/quantized + vision_encoder (nosso modelo é texto)
+            if p.name.startswith(("embed_tokens", "decoder_model_merged", "vision_encoder")) or p.suffix in (".onnx", ".onnx_data"):
+                if p.name not in keep:
+                    print(f"  removendo {p.name}")
+                    p.unlink()
 
-    # ---- 2. Renomeia pro layout do runtime ----
-    # optimum gera model.onnx (decoder) + model.onnx_data; o runtime espera
-    # decoder_model_merged_q4.onnx/.onnx_data + embed_tokens_q4.onnx/.onnx_data.
-    # O embed (lookup) sai do decoder via --export-embeddings do optimum, ou
-    # é um subgrafo — aqui assumimos que o optimum já separou (ver docs).
-    renames = {
-        "model.onnx": "decoder_model_merged_q4.onnx",
-        "model.onnx_data": "decoder_model_merged_q4.onnx_data",
-    }
-    for src, dst in renames.items():
-        if (out / src).exists():
-            shutil.move(str(out / src), str(out / dst))
-            print(f"  {src} -> {dst}")
+    # ---- 3. Verifica os 2 arquivos do runtime ----
+    ok = True
+    for f in ["embed_tokens_q4.onnx", "embed_tokens_q4.onnx_data",
+              "decoder_model_merged_q4.onnx", "decoder_model_merged_q4.onnx_data"]:
+        p = out / f
+        if p.exists():
+            print(f"  OK  {f} ({p.stat().st_size/1024/1024:.1f}MB)")
+        else:
+            print(f"  FALTA {f}")
+            ok = False
 
-    # ---- 3. Quantiza INT4 (block-wise, group_size=32) ----
-    if args.quant == "q4":
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        print("[export] quantizando pesos para INT4 ...")
-        for name in ["decoder_model_merged_q4.onnx", "embed_tokens_q4.onnx"]:
-            p = out / name
-            if not p.exists():
-                print(f"  {name}: não encontrado, pula")
-                continue
-            tmp = out / (name + ".q4")
-            quantize_dynamic(str(p), str(tmp), weight_type=QuantType.QUInt4)
-            os.replace(str(tmp), str(p))
-            print(f"  {name}: quantizado")
-
-    # ---- 4. Copia tokenizer.json (runtime lê direto) ----
-    if (out / "tokenizer.json").exists():
-        print("[export] tokenizer.json OK")
-
-    print(f"[export] pronto em {args.out}")
-    print("Próximo: copiar pro runtime (models/) e rodar quick-check + bench")
+    if ok:
+        print(f"[export] pronto em {out}")
+        print("Próximo: copiar os 4 arquivos pro runtime (models/) e rodar quick-check + bench")
+    else:
+        print("[export] incompleto — verifique acima")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
