@@ -28,6 +28,9 @@ app = FastAPI(title="Qwen System-One GPU Server")
 
 print(f"[gpu-serve] Carregando modelo em GPU A100 de: {MODEL_PATH}")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+tokenizer.padding_side = "left"
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH,
     torch_dtype=torch.bfloat16,
@@ -92,63 +95,81 @@ def health():
 import threading
 gpu_lock = threading.Lock()
 MAX_CONTEXT = 32768
+BATCH_SIZE = 32
 
 @app.post("/v1/systemone")
 def systemone(body: dict):
     state = body.get("state")
     questions = body.get("questions", {})
     
-    answers = {}
-    for qid, qdef in questions.items():
+    qids = list(questions.keys())
+    if not qids:
+        return {"model": body.get("model", "qwen-system-one"), "answers": {}}
+        
+    prompts = []
+    keys_list = []
+    qtypes = []
+    for qid in qids:
+        qdef = questions[qid]
         qtype = qdef.get("type", "choice")
         prompt, keys = render_question(state, qdef)
-        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+        prompts.append(prompt)
+        keys_list.append(keys)
+        qtypes.append(qtype)
         
+    answers = {}
+    
+    # Processar em lotes (para 1 pergunta roda em batch=1; para BFCL/ToolRet processa até 32 de uma vez!)
+    for b_start in range(0, len(prompts), BATCH_SIZE):
+        b_end = min(b_start + BATCH_SIZE, len(prompts))
+        b_prompts = prompts[b_start:b_end]
+        b_qids = qids[b_start:b_end]
+        b_keys = keys_list[b_start:b_end]
+        b_types = qtypes[b_start:b_end]
+        
+        inputs = tokenizer(b_prompts, padding=True, return_tensors="pt").to("cuda")
         seq_len = inputs["input_ids"].shape[1]
         if seq_len > MAX_CONTEXT:
             return JSONResponse(
                 status_code=422,
                 content={"error": f"prompt length {seq_len} exceeds maximum context length {MAX_CONTEXT}"}
             )
-        
+            
         with gpu_lock:
             with torch.no_grad():
                 try:
                     out = model(**inputs, logits_to_keep=1)
                 except TypeError:
                     out = model(**inputs)
-                logits = out.logits[0, -1] # último token da sequência
+                all_logits = out.logits[:, -1]
                 
-                k = len(keys)
-                target_ids = LABEL_TOKEN_IDS[:k]
-                label_logits = logits[target_ids]
+        for i, qid in enumerate(b_qids):
+            keys = b_keys[i]
+            qtype = b_types[i]
+            k = len(keys)
+            target_ids = LABEL_TOKEN_IDS[:k]
+            label_logits = all_logits[i, target_ids]
+            probs_t = torch.softmax(label_logits / TEMPERATURE, dim=-1).cpu().tolist()
+            choice_idx = max(range(k), key=lambda idx: probs_t[idx])
+            choice_key = keys[choice_idx]
+            prob_dict = {keys[idx]: float(probs_t[idx]) for idx in range(k)}
+            s = sum(prob_dict.values())
+            if s > 0:
+                prob_dict = {k: v / s for k, v in prob_dict.items()}
                 
-                # Softmax com a temperatura calibrada
-                probs_t = torch.softmax(label_logits / TEMPERATURE, dim=-1).cpu().tolist()
-                
-        choice_idx = max(range(k), key=lambda i: probs_t[i])
-        choice_key = keys[choice_idx]
-        
-        prob_dict = {keys[i]: float(probs_t[i]) for i in range(k)}
-        # Normalizar para garantir soma exata = 1.0 (evita arredondamento de float)
-        s = sum(prob_dict.values())
-        if s > 0:
-            prob_dict = {k: v / s for k, v in prob_dict.items()}
-            
-        if qtype == "noul":
-            true_idx = keys.index("true")
-            answers[qid] = {
-                "type": "noul",
-                "noul": float(prob_dict["true"])
-            }
-        else:
-            answers[qid] = {
-                "type": qtype,
-                "choice": choice_key,
-                "probabilities": prob_dict,
-                "confidence": float(probs_t[choice_idx])
-            }
-        
+            if qtype == "noul":
+                answers[qid] = {
+                    "type": "noul",
+                    "noul": float(prob_dict.get("true", 0.5))
+                }
+            else:
+                answers[qid] = {
+                    "type": qtype,
+                    "choice": choice_key,
+                    "probabilities": prob_dict,
+                    "confidence": float(probs_t[choice_idx])
+                }
+
     return {
         "model": body.get("model", "qwen-system-one"),
         "answers": answers

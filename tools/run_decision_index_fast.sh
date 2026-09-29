@@ -3,8 +3,7 @@ set -e
 
 # ==============================================================================
 # QWEN-SYSTEM-ONE v1.1.0: HIGH-SPEED JEV DECISION INDEX BENCHMARK (A100)
-# Executa as 120.000 requisições a ~250-450 req/s em ~5 a 8 minutos!
-# Concorrência otimizada com 32 workers e retomada automática sem perda de dados.
+# Executa as 120.000 requisições a alta velocidade com intra-row batching e 32 workers!
 # ==============================================================================
 
 echo "================================================================="
@@ -19,23 +18,32 @@ cd "$WORKDIR"
 echo "[1/4] Instalando dependencias de alta performance..."
 pip install -q fastapi uvicorn urllib3
 
-# 2. Reiniciar Servidor GPU A100 com as novas otimizacoes (logits_to_keep=1 + noul fix)
-echo "[2/4] Iniciando Servidor GPU A100 otimizado (porta 8093)..."
-pkill -f qwen_gpu_serve || true
-sleep 1
-python3 /content/drive/MyDrive/qwen-system-one/tools/qwen_gpu_serve.py > /content/gpu_serve.log 2>&1 &
+# 2. Obter scripts atualizados diretamente para o disco NVMe local (evita lag de cache do Drive)
+TOOLS_DIR="/content/qwen_tools"
+mkdir -p "$TOOLS_DIR"
+echo "  -> Baixando scripts otimizados (batching v2)..."
+curl -s -L https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/qwen_gpu_serve.py -o "$TOOLS_DIR/qwen_gpu_serve.py"
+curl -s -L https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/fast_decision_runner.py -o "$TOOLS_DIR/fast_decision_runner.py"
+
+# 3. Encerrar qualquer processo antigo e liberar porta 8093
+echo "[2/4] Reiniciando Servidor GPU A100 otimizado (porta 8093)..."
+pkill -9 -f qwen_gpu_serve || true
+fuser -k 8093/tcp || true
+sleep 2
+
+python3 "$TOOLS_DIR/qwen_gpu_serve.py" > /content/gpu_serve.log 2>&1 &
 
 # Aguardar servidor GPU responder no health check
-echo "  -> Aguardando inicializacao do modelo na VRAM da A100..."
-for i in {1..30}; do
+echo "  -> Aguardando carregamento do modelo na VRAM da A100..."
+for i in {1..60}; do
     if curl -s http://127.0.0.1:8093/health | grep -q "qwen-gpu-serve"; then
-        echo "  -> Servidor GPU A100 pronto e respondendo em http://127.0.0.1:8093!"
+        echo "  -> Servidor GPU A100 online e respondendo em http://127.0.0.1:8093!"
         break
     fi
     sleep 1
 done
 
-# 3. Garantir kit oficial decision-index
+# 4. Garantir kit oficial decision-index
 echo "[3/4] Verificando kit oficial decision-index..."
 if [ ! -d "decision-index" ]; then
     git clone https://github.com/apolinario/decision-index.git
@@ -55,12 +63,12 @@ else
     echo "  -> Suite oficial de 120k questoes pronta em $SUITE_WORK!"
 fi
 
-# 4. Executar o Fast Concurrent Runner com 32 threads paralelas!
+# 5. Executar o Fast Concurrent Runner com 32 threads paralelas!
 OUT_DIR="/content/decision_benchmark/runs/qwen-system-one-v1.1"
 mkdir -p "$OUT_DIR"
 
-echo "[4/4] Executando benchmark acelerado (32 threads concorrentes na A100)..."
-python3 /content/drive/MyDrive/qwen-system-one/tools/fast_decision_runner.py \
+echo "[4/4] Executando benchmark acelerado com batching na A100..."
+python3 "$TOOLS_DIR/fast_decision_runner.py" \
     --base-url "http://127.0.0.1:8093" \
     --rows "$ROWS" \
     --out "$OUT_DIR" \
