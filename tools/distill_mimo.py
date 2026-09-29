@@ -452,9 +452,13 @@ def main():
             remaining = len(mining_pool) - stats["done"]
             eta_m = int((remaining / rate) // 60) if rate > 0 else 0
             eta_s = int((remaining / rate) % 60) if rate > 0 else 0
-            if stats["done"] % 10 == 0 or stats["done"] == len(mining_pool):
-                print(f"[{stats['done']:,}/{len(mining_pool):,} ({stats['done']/len(mining_pool)*100:.1f}%)] "
-                      f"Vazao: {rate:.1f} req/s | OK: {stats['ok']:,} | Match Gold: {stats['verified_match']:,} | ETA: {eta_m:02d}:{eta_s:02d}", end="\r")
+            if stats["done"] % 5 == 0 or stats["done"] == len(mining_pool):
+                pct = (stats['done'] / len(mining_pool)) * 100.0 if len(mining_pool) > 0 else 0
+                el_s = int(dt % 60)
+                el_m = int(dt // 60)
+                print(f"[{stats['done']:,}/{len(mining_pool):,} ({pct:.1f}%)] "
+                      f"Vazao: {rate:.1f} req/s | OK: {stats['ok']:,} | Match Gold: {stats['verified_match']:,} | Erros: {stats['errors']:,} | Tempo: {el_m:02d}:{el_s:02d} | ETA: {eta_m:02d}:{eta_s:02d}   ",
+                      end="\r", flush=True)
 
         return record, None
 
