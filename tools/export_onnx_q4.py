@@ -26,13 +26,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Patch de compatibilidade: versões do onnx que buscam float4_e2m1fn no ml_dtypes
+# Patch de compatibilidade universal para ml_dtypes com onnx (intercepta qualquer tipo ausente)
 import numpy as np
 try:
-    import ml_dtypes
-    for attr in ["float4_e2m1fn", "float4_e2m1"]:
-        if not hasattr(ml_dtypes, attr):
-            setattr(ml_dtypes, attr, np.uint8)
+    import ml_dtypes as real_ml
+    class MlProxy:
+        def __getattr__(self, name):
+            if hasattr(real_ml, name):
+                return getattr(real_ml, name)
+            return np.uint8
+        def __dir__(self):
+            return dir(real_ml)
+    sys.modules['ml_dtypes'] = MlProxy()
 except ImportError:
     pass
 
