@@ -42,13 +42,12 @@ const perLevel = parseInt(val('requests', '16'), 10);
 const noSpawn = flag('no-spawn');
 
 let explicitBinary = val('binary', null);
-if (!explicitBinary) {
-  const defaultBin = process.platform === 'win32'
+const binPath = explicitBinary
+  ? path.resolve(process.cwd(), explicitBinary)
+  : (process.platform === 'win32'
     ? path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve.exe')
-    : path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve');
-  explicitBinary = defaultBin;
-}
-const binPath = path.resolve(ROOT, explicitBinary);
+    : path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve'));
+
 
 const STATES = [
   'We were billed twice on the March invoice and want a refund.',

@@ -54,25 +54,24 @@ print('  -> HASH SHA256 OK: 100% modelo treinado decider08_full v1.1.0!')
 "
 
 # 4. Clonar scripts de benchmark oficiais do repo
-if [ ! -f "quick-check.js" ]; then
-    echo "  -> Baixando scripts de teste do GitHub Actions..."
-    curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/quick-check.js -o quick-check.js
-    curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/bench-concurrent.js -o bench-concurrent.js
-fi
+echo "  -> Baixando scripts de teste do GitHub Actions..."
+curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/quick-check.js -o quick-check.js
+curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/bench-concurrent.js -o bench-concurrent.js
 
 # 5. Executar os testes idênticos aos do GitHub Actions CI
+BIN_PATH="$WORKDIR/qwen-serve"
 echo ""
 echo "================================================================="
 echo "   [TESTE 1/2] TRIAGEM MULTILÍNGUE (10 CASOS: PT, EN, ES)        "
 echo "================================================================="
-node quick-check.js --binary ./qwen-serve --model "$MODEL_DIR" --port 8094
+node quick-check.js --binary "$BIN_PATH" --model "$MODEL_DIR" --port 8094
 
 echo ""
 echo "================================================================="
 echo "   [TESTE 2/2] VAZÃO CONCORRENTE REAL (c=1, c=2, c=4, c=8)       "
 echo "   (Cache-busted: mede inferência real de cada requisição)       "
 echo "================================================================="
-node bench-concurrent.js --binary ./qwen-serve --model "$MODEL_DIR" --port 8096 --levels 1,2,4,8 --requests 16
+node bench-concurrent.js --binary "$BIN_PATH" --model "$MODEL_DIR" --port 8096 --levels 1,2,4,8 --requests 16
 
 echo ""
 echo "================================================================="

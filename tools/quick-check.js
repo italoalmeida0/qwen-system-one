@@ -29,13 +29,12 @@ const maxCases = parseInt(val('cases', '0'), 10);
 const prefixCache = val('prefix-cache', null);
 
 let explicitBinary = val('binary', null);
-if (!explicitBinary) {
-  const defaultBin = process.platform === 'win32'
+const binPath = explicitBinary
+  ? path.resolve(process.cwd(), explicitBinary)
+  : (process.platform === 'win32'
     ? path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve.exe')
-    : path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve');
-  explicitBinary = defaultBin;
-}
-const binPath = path.resolve(ROOT, explicitBinary);
+    : path.join(ROOT, 'native', 'qwen-serve', 'target', 'release', 'qwen-serve'));
+
 
 if (!fs.existsSync(binPath)) {
   console.error(`[quick-check] binary not found at: ${binPath}`);
