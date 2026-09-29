@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--out", required=True, help="pasta de saída dos .onnx")
     ap.add_argument("--task", default="image-text-to-text", help="task do optimum (mesma do repo de referência)")
     ap.add_argument("--optimize", default="O2", help="nível de otimização/quant do optimum")
+    ap.add_argument("--keep-variants", action="store_true", help="mantém fp16/uint8/q4f16 p/ comparar no quick-check")
     args = ap.parse_args()
 
     model = Path(args.model)
@@ -50,9 +51,12 @@ def main():
         sys.exit(1)
 
     # ---- 2. Mantém só as variantes q4 (formato do runtime) ----
-    keep = {"embed_tokens_q4.onnx", "embed_tokens_q4.onnx_data",
-            "decoder_model_merged_q4.onnx", "decoder_model_merged_q4.onnx_data",
-            "tokenizer.json", "tokenizer_config.json", "config.json"}
+    if args.keep_variants:
+        keep = {p.name for p in out.iterdir()}  # mantém tudo
+    else:
+        keep = {"embed_tokens_q4.onnx", "embed_tokens_q4.onnx_data",
+                "decoder_model_merged_q4.onnx", "decoder_model_merged_q4.onnx_data",
+                "tokenizer.json", "tokenizer_config.json", "config.json"}
     for p in sorted(out.iterdir()):
         if p.name not in keep:
             # remove fp32/fp16/q4f16/quantized + vision_encoder (nosso modelo é texto)
