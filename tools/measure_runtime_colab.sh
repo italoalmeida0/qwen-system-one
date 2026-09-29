@@ -21,8 +21,12 @@ free -h | grep "Mem:" || true
 echo ""
 
 # 2. Obter o binário oficial nativo linux-x64
-echo "[2/5] Baixando binário oficial nativo linux-x64 do qwen-serve..."
-if [ ! -f "qwen-serve" ]; then
+echo "[2/5] Obtendo binário oficial nativo linux-x64 do qwen-serve..."
+if [ -f "/content/drive/MyDrive/qwen-system-one/bin/qwen-serve" ]; then
+    echo "  -> Usando binário do Google Drive (sem cache da web)..."
+    cp /content/drive/MyDrive/qwen-system-one/bin/qwen-serve qwen-serve
+    chmod +x qwen-serve
+elif [ ! -f "qwen-serve" ]; then
     wget -q --show-progress https://github.com/italoalmeida0/qwen-system-one/releases/download/v1.1.0/qwen-serve-linux-x64 -O qwen-serve
     chmod +x qwen-serve
 fi
@@ -53,10 +57,16 @@ if h != expected:
 print('  -> HASH SHA256 OK: 100% modelo treinado decider08_full v1.1.0!')
 "
 
-# 4. Clonar scripts de benchmark oficiais do repo
-echo "  -> Baixando scripts de teste do GitHub Actions..."
-curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/quick-check.js -o quick-check.js
-curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/bench-concurrent.js -o bench-concurrent.js
+# 4. Obter scripts de benchmark oficiais
+if [ -f "/content/drive/MyDrive/qwen-system-one/tools/quick-check.js" ]; then
+    echo "  -> Usando scripts do Google Drive enviados via rclone (sem cache)..."
+    cp /content/drive/MyDrive/qwen-system-one/tools/quick-check.js quick-check.js
+    cp /content/drive/MyDrive/qwen-system-one/tools/bench-concurrent.js bench-concurrent.js
+else
+    echo "  -> Baixando scripts de teste do GitHub Actions..."
+    curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/quick-check.js -o quick-check.js
+    curl -fsSL https://raw.githubusercontent.com/italoalmeida0/qwen-system-one/main/tools/bench-concurrent.js -o bench-concurrent.js
+fi
 
 # 5. Executar os testes idênticos aos do GitHub Actions CI
 BIN_PATH="$WORKDIR/qwen-serve"
