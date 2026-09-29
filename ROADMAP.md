@@ -313,15 +313,21 @@ Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPoo
    * Mixture EN oficial do Decider: `decider.data.core` (~95 datasets públicos, `teacher_data/`) → `tasks.pkl` (968.970 base) → `mixture_full.pkl` (**1.544.122** finais, com os 555 multilíngues injetados via `tools/inject_multi.py`).
    * Multilíngue: `tools/make_multi_typed.py` converte MINDS-14 (en-US/de-DE/es-ES/pt-PT/zh-CN) para typed-decision no TEMPLATE do runtime. Overlap check 8-gram vs `tasks.pkl` EN + duplicatas internas → `multi_clean.jsonl` (555 limpos, 2 overlaps EN removidos).
    * Tudo cacheado no Google Drive (base 1.6GB + tasks.pkl 751MB + 5 parquets + repo Decider zipado) — notebook **100% offline**, zero download no Colab.
-2. **Treinamento 🔄 (2026-09-28, Colab Pro/A100-80GB)**:
+2. **Treinamento ✅ (2026-09-28/29, Colab Pro/A100-80GB, ~10.5h)**:
    * `notebooks/train-qwen1-colab.ipynb` (12 células): setup → dados do Drive → overlap check → mixture+inject → treino → calibração T.
    * Receita Decider 0.8B: 1 época, LR 1e-5 (cosine), warmup 150, `max_tokens 16384`, `max_options 255`, `schema_first_prob 0.5` (metade no formato do nosso runtime), `none_prob 0.1`.
-   * Progresso medido: tokenizing 43min (463.1M tokens, 16.932 optimizer steps) → loss caindo saudável: `ce 1.79 (step 20) → 0.71 (2800) → 0.55-0.67 (6900)`, mem 10GB/80GB, ~14k tok/s.
+   * Progresso medido: tokenizing 43min (463.1M tokens, 16.932 optimizer steps) → loss caindo saudável: `ce 1.79 (step 20) → 0.71 (2800) → 0.55-0.67 (6900) → 0.59 (16932)`, mem 10GB/80GB, ~14k tok/s.
    * Output: `/content/drive/MyDrive/qwen-system-one/runs/decider08_full/model` (full-finetune, não LoRA).
-3. **Conversão e Publicação do Modelo v1.1.0** ⏳ (próximo passo):
-   * Calibração do T em held-out (Decider-0.8B: 1.03; JPT: 1.140 — nosso default atual).
-   * Avaliação: `evaluate.sh` do Decider (in-task vs **0.776/0.707**) + quick-check + Decision Index cego (vs **19.22** do JPT, **6.04** do Laya).
-   * Merge → export ONNX (dual-export compat já existe no runtime: OPT fundido + padrão) → quant Q4 (`embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx`).
+3. **Avaliação ✅ (2026-09-29, eval oficial do Decider)**:
+   * **in-task acc = 0.767** (Decider 0.776 — empate técnico, ruído de seed).
+   * **held-out acc = 0.739** (Decider 0.707 — **GANHAMOS +0.032** 🏆). Held-out = 28 tasks nunca vistas = generalização real.
+   * held-out ECE 0.109 (calibração boa), acc@80 = 0.787.
+   * Destaques: `dbpedia_l3 1.000`, `bitext_support 0.993`, `toxic_chat 0.970`, `banking77 0.973`, `clinc_oos 0.967` — brilhante em triagem/classificação (nosso caso de uso).
+   * Fracos (não importam pro produto): `truthfulqa 0.387`, `dolly_category 0.313` (conhecimento geral/trivia — não é o que vendemos).
+4. **Conversão e Publicação do Modelo v1.1.0** ⏳ (próximo passo):
+   * `tools/export_onnx_q4.py` (optimum + quant INT4 block-wise, group_size=32) → `embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx` novos.
+   * Calibração T em held-out (célula 5: `decider.calibrate` por tipo — choice/noul/score).
+   * Quick-check 10 casos de triagem PT/EN (célula 5c).
    * Empacotamento do novo `.model` e publicação na Release `v1.1.0` do GitHub.
    * Reavaliação no quick-check + bench (CI já mede miss vs hit separados — avaliar o modelo novo com `--cache-size 0`).
 
