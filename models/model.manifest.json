@@ -1,10 +1,10 @@
 {
   "$comment": "Qwen 3.5 0.8B Q4 ONNX decision model package manifest",
   "model": "qwen-0.8b-q4.model",
-  "version": "1.0.0",
-  "modelVersion": "1.0.0",
-  "bytes": 558953443,
-  "sha256": "6bdd4735cb967bb83087c96acfde602850006a87f03aacf1d7da617b8e9432e4",
+  "version": "1.1.0",
+  "modelVersion": "1.1.0",
+  "bytes": 560213568,
+  "sha256": "f845cbc2e45418c68ac1379e101a1c38764a33c736e8a4cc3e8ba077f5b4bee1",
   "files": [
     {
       "name": "embed_tokens_q4.onnx",
@@ -14,17 +14,17 @@
     {
       "name": "embed_tokens_q4.onnx_data",
       "bytes": 162897920,
-      "sha256": "9210b1d26eb14136d3522584d17da14cc5f4b82b6f5607e6d80d59424a8cbe99"
+      "sha256": "e987635526f510d74d24097605881e82f7151af17bb720fb22b0982b086619dc"
     },
     {
       "name": "decoder_model_merged_q4.onnx",
       "bytes": 576621,
-      "sha256": "7390858c80a67275d8cb81fb70f66a24d3b86fe333057c1312de09c184a2d41b"
+      "sha256": "208bd4a1f62c865279a28ee2dbfbb42a41bcdd8e23afe1f60470dbb40698ba7e"
     },
     {
       "name": "decoder_model_merged_q4.onnx_data",
       "bytes": 483655680,
-      "sha256": "1a9165072dd51a9b6a917b6357a3686372b7429313022802cd4c9a730e8c9749"
+      "sha256": "ce5fa68c23aac7d6594f7a4a2b29c640c3a7aecf457b6bcabbdc0d5eb66bbf70"
     },
     {
       "name": "tokenizer.json",
@@ -32,5 +32,5 @@
       "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
     }
   ],
-  "source": "https://github.com/italoalmeida0/qwen-system-one/releases/download/v1.0.0/qwen-0.8b-q4.model"
+  "source": "https://github.com/italoalmeida0/qwen-system-one/releases/download/v1.1.0/qwen-0.8b-q4.model"
 }

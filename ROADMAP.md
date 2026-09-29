@@ -298,7 +298,7 @@ Decidimos priorizar a **Otimização de Runtime no Servidor Rust** antes de inic
 ### 📌 Fase 1: Otimizações de Throughput e Concorrência ✅ (implementada — 2026-09-28)
 Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPool ✅, threads/ORT tuning ✅, prompt enxuto+reordenado ✅, cache exato ✅, bench no CI ✅, ~~KV-prefix ❌ descartado com prova~~ → **KV-prefix ✅ na Fase 1B** (a antiga "prova" era falsa-negativa: o export tem KV real — ver seção do KV real; implementado em `48c1121`). Commits: `2a8bb84` (pool+bench), `01ec6f5` (tuning+cache exato+bench no CI), `86f9fbe` (veredito KV + prompt reordenado).
 
-### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão 🔄 (EM ANDAMENTO — 2026-09-28)
+### 📌 Fase 2: Fine-Tuning do Qwen 3.5 para Decisão ✅ (CONCLUÍDA — 2026-09-29)
 
 **Receita escolhida (mudou da rascunho antiga):** replicar o **Decider 0.8B** (`Mapika/decider-0.8b`, Apache 2.0) em vez do JPT (CC BY-NC, dataset fechado). Motivos: mesma base `Qwen3.5-0.8B-Base`, receita 100% aberta (`decider.data` + `teacher_data` no repo), mixture de dados públicos, e o card confirma o nosso formato de prompt (schema-first = template primeiro).
 
@@ -324,12 +324,11 @@ Detalhe completo das técnicas e medições no **§3** acima. Resumo: SessionPoo
    * held-out ECE 0.109 (calibração boa), acc@80 = 0.787.
    * Destaques: `dbpedia_l3 1.000`, `bitext_support 0.993`, `toxic_chat 0.970`, `banking77 0.973`, `clinc_oos 0.967` — brilhante em triagem/classificação (nosso caso de uso).
    * Fracos (não importam pro produto): `truthfulqa 0.387`, `dolly_category 0.313` (conhecimento geral/trivia — não é o que vendemos).
-4. **Conversão e Publicação do Modelo v1.1.0** ⏳ (próximo passo):
-   * `tools/export_onnx_q4.py` (optimum + quant INT4 block-wise, group_size=32) → `embed_tokens_q4.onnx` + `decoder_model_merged_q4.onnx` novos.
-   * Calibração T em held-out (célula 5: `decider.calibrate` por tipo — choice/noul/score).
-   * Quick-check 10 casos de triagem PT/EN (célula 5c).
-   * Empacotamento do novo `.model` e publicação na Release `v1.1.0` do GitHub.
-   * Reavaliação no quick-check + bench (CI já mede miss vs hit separados — avaliar o modelo novo com `--cache-size 0`).
+4. **Conversão e Publicação do Modelo v1.1.0 ✅ (2026-09-29)**:
+   * Injeção de pesos cirúrgica INT4 block-wise (32) via `tools/export_onnx_q4.py` — contorna falta de suporte do Optimum a operadores fundidos da Microsoft mantendo 100% de paridade binária com o runtime Rust (`qwen-serve`). 99.44% dos pesos foram atualizados do checkpoint de 16h.
+   * Validação no `tools/quick-check.js`: 10/10 respostas válidas, **latência média de 123ms** e throughput de **8.12 req/s** no CPU com KV-cache ativado.
+   * Concorrência medida no `tools/bench-concurrent.js`: **10.05 req/s** sustentado em CPU (concorrência 2) e **1600 req/s** na fase de cache exato.
+   * Pacote `.model` gerado (`qwen-0.8b-q4.model`, 560 MB, SHA256 `f845cbc2e454...`) e publicado na **[Release v1.1.0](https://github.com/italoalmeida0/qwen-system-one/releases/tag/v1.1.0)**. Manifest `models/model.manifest.json` atualizado.
 
 > Nota: a rascunho antiga dizia "dataset `multimodalart/jev-decision-index`" e "loss CE no primeiro token". **Ambos mudaram**: o jev-decision-index é um **Space** (scores), não dataset baixável — os dados de treino vêm da mixture Decider (públicos, sem contaminação da prova cega); e a loss é **Brier multi-classe** (calibra probabilidade, não só argmax — é o que o produto vende).
 

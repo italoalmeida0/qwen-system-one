@@ -1,6 +1,6 @@
 {
   "name": "qwen-system-one",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Self-contained Qwen 3.5 0.8B System 1 decision engine: INT4 ONNX transformer served by a zero-dependency native Rust binary. TypeSafe Jev wire-compatible (/v1/systemone).",
   "type": "module",
   "scripts": {
