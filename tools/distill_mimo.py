@@ -150,28 +150,39 @@ def query_mimo_teacher(api_key, api_base, model, instructions, options_str, stat
                     data = json.loads(resp.read().decode("utf-8"))
                     content = data["choices"][0]["message"]["content"].strip()
                     
-                    # Extrair a letra da decisão (ex: "Decision: B" ou procura por LABEL_CHARS)
+                    # 1. Procurar por letra explícita: "Decision: B", "Option C", "Answer: A"
                     chosen_label = None
                     import re
-                    # Procurar por "Decision: X" ou "Option X" ou "Answer: X"
                     m = re.search(r'(?:Decision|Answer|Option|Choice)\s*[:=\-]?\s*([A-Z])\b', content, re.IGNORECASE)
                     if m:
                         cand = m.group(1).upper()
                         if cand in valid_labels:
                             chosen_label = cand
-                    
+
+                    # 2. Se o modelo respondeu com número (ex: "Option 2" -> B, "Decision: 1" -> A)
                     if not chosen_label:
-                        # Busca por última letra válida mencionada isoladamente
+                        m_num = re.search(r'(?:Decision|Answer|Option|Choice)\s*[:=\-]?\s*(\d+)\b', content, re.IGNORECASE)
+                        if m_num:
+                            num = int(m_num.group(1))
+                            if 1 <= num <= len(valid_labels):
+                                chosen_label = valid_labels[num - 1]
+                            elif num == 0 and len(valid_labels) > 0:
+                                chosen_label = valid_labels[0]
+                            # Se for out-of-bounds (ex: "Decision: 8" para 4 opções), permanece None (rejeitado)
+
+                    # 3. Busca por última letra válida mencionada isoladamente no texto
+                    if not chosen_label:
                         tokens = re.findall(r'\b([A-Z])\b', content)
                         for t in reversed(tokens):
                             if t in valid_labels:
                                 chosen_label = t
                                 break
-                                
-                    if chosen_label:
+
+                    # 4. Validação final: se a opção não estiver no conjunto restrito, rejeita o item
+                    if chosen_label and chosen_label in valid_labels:
                         return chosen_label, content
                     else:
-                        return None, f"Could not parse valid label from response: {content[:100]}"
+                        return None, f"Could not parse valid label from response (expected one of {valid_labels}): {content[:120]}"
                         
         except urllib.error.HTTPError as he:
             err_text = he.read().decode("utf-8", errors="replace")
