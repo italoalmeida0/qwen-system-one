@@ -26,6 +26,35 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Patch de compatibilidade no disco: get_parameter_dtype removido no transformers 5, exigido pelo optimum
+def _patch_transformers_disk():
+    import glob, sysconfig
+    patch_code = (
+        "\n\ndef get_parameter_dtype(parameter):\n"
+        "    try:\n"
+        "        return next(parameter.parameters()).dtype\n"
+        "    except Exception:\n"
+        "        return getattr(parameter, 'dtype', None)\n"
+    )
+    paths = [
+        os.path.join(sysconfig.get_path("purelib"), "transformers", "modeling_utils.py"),
+        os.path.join(sysconfig.get_path("platlib"), "transformers", "modeling_utils.py"),
+    ] + glob.glob("/usr/local/**/transformers/modeling_utils.py", recursive=True)
+
+    for p in set(paths):
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "def get_parameter_dtype" not in content:
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(patch_code)
+                    print(f"[patch] get_parameter_dtype injetado no arquivo em disco: {p}")
+            except Exception:
+                pass
+
+_patch_transformers_disk()
+
 # Patch de compatibilidade universal para ml_dtypes com onnx (intercepta qualquer tipo ausente)
 import numpy as np
 try:
@@ -41,7 +70,7 @@ try:
 except ImportError:
     pass
 
-# Patch de compatibilidade: get_parameter_dtype removido no transformers 5, exigido pelo optimum
+# Patch de compatibilidade em memória: get_parameter_dtype
 try:
     import transformers.modeling_utils
     if not hasattr(transformers.modeling_utils, "get_parameter_dtype"):
@@ -198,16 +227,62 @@ def main():
         embed_candidates = [
             temp_dir / "embed_tokens.onnx",
             temp_dir / "onnx" / "embed_tokens.onnx",
+            temp_dir / "embeddings.onnx",
+            temp_dir / "onnx" / "embeddings.onnx",
         ]
         embed_src = next((p for p in embed_candidates if p.exists()), None)
 
         decoder_candidates = [
             temp_dir / "decoder_model_merged.onnx",
             temp_dir / "onnx" / "decoder_model_merged.onnx",
+            temp_dir / "decoder_model.onnx",
+            temp_dir / "onnx" / "decoder_model.onnx",
             temp_dir / "model.onnx",
             temp_dir / "onnx" / "model.onnx",
         ]
         decoder_src = next((p for p in decoder_candidates if p.exists()), None)
+
+        # Fallback de segurança: se embed_tokens.onnx não foi gerado separadamente pelo optimum,
+        # constrói o grafo ONNX do embedding diretamente a partir dos pesos safetensors
+        if not embed_src:
+            print("[aviso] embed_tokens.onnx não encontrado na saída do optimum. Tentando extrair pesos do embedding...")
+            try:
+                import torch
+                from safetensors.torch import load_file
+                safetensors_path = model / "model.safetensors"
+                if not safetensors_path.exists():
+                    st_list = list(model.glob("*.safetensors"))
+                    safetensors_path = st_list[0] if st_list else None
+                if safetensors_path and safetensors_path.exists():
+                    weights = load_file(str(safetensors_path))
+                    emb_weight = None
+                    for k in ["model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight"]:
+                        if k in weights:
+                            emb_weight = weights[k]
+                            break
+                    if emb_weight is not None:
+                        class EmbedModule(torch.nn.Module):
+                            def __init__(self, w):
+                                super().__init__()
+                                self.embed = torch.nn.Embedding.from_pretrained(w.to(torch.float32))
+                            def forward(self, input_ids):
+                                return self.embed(input_ids)
+                        mod = EmbedModule(emb_weight)
+                        dummy_input = torch.tensor([[1]], dtype=torch.int64)
+                        emb_onnx_path = temp_dir / "embed_tokens.onnx"
+                        torch.onnx.export(
+                            mod,
+                            dummy_input,
+                            str(emb_onnx_path),
+                            input_names=["input_ids"],
+                            output_names=["inputs_embeds"],
+                            dynamic_axes={"input_ids": {0: "batch", 1: "sequence"}, "inputs_embeds": {0: "batch", 1: "sequence"}},
+                            opset_version=14,
+                        )
+                        embed_src = emb_onnx_path
+                        print(f"[fallback] embed_tokens.onnx gerado via safetensors: {embed_src}")
+            except Exception as e:
+                print(f"[fallback] aviso ao extrair embedding: {e}")
 
         if not embed_src:
             raise FileNotFoundError(f"Não encontrou embed_tokens.onnx em {temp_dir}. Arquivos encontrados: {[p.name for p in temp_dir.rglob('*.onnx')]}")
