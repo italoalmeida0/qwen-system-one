@@ -130,6 +130,180 @@ node tools/bench-concurrent.js --workers 2 --levels 1,2,4,8 --requests 16
 
 ---
 
+---
+
+## 🧩 Question Types
+
+### `choice` — Multiple Choice (Single Selection)
+Selects one label from fixed options. Supports either a `criteria` map (label -> criterion) or a plain `options` array.
+
+```json
+{
+  "type": "choice",
+  "instructions": "Which department should handle this ticket?",
+  "criteria": {
+    "billing": "refunds, charges, payments and invoices",
+    "tech": "bugs, crashes, downtime and technical issues",
+    "sales": "upgrades, subscriptions, contracts and seat purchases"
+  }
+}
+```
+
+Response:
+```json
+{
+  "choice": "billing",
+  "probability": 0.985,
+  "probabilities": { "billing": 0.985, "tech": 0.01, "sales": 0.005 },
+  "confidence": 0.97
+}
+```
+
+### `score` — Numeric Scoring (0-1)
+Outputs a normalized score in the range `[0, 1]`. An optional `threshold` overrides the default 0.5.
+
+```json
+{
+  "type": "score",
+  "instructions": "Rate the urgency of this request",
+  "threshold": 0.5
+}
+```
+
+Response:
+```json
+{ "score": 0.82, "probability": 0.82, "confidence": 0.74 }
+```
+
+### `noul` — Nullability / Binary Classification (Yes/No)
+Returns `true` (yes), `false` (no), or `null` (not enough information in the state). Binary case of `choice` with `null` support.
+
+```json
+{
+  "type": "noul",
+  "instructions": "Does this message contain a refund request?"
+}
+```
+
+Response:
+```json
+{ "value": true, "probability": 0.93, "confidence": 0.88 }
+```
+
+---
+
+## 🌐 HTTP API Reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness + model info + pool/cache stats |
+| `POST` | `/v1/systemone` | TypeSafe Jev decision endpoint |
+
+### `GET /health`
+```json
+{
+  "status": "ok",
+  "backend": "qwen-serve",
+  "model": "onnx-community/Qwen3.5-0.8B-ONNX-OPT",
+  "runtime": "native-rust-onnx",
+  "workers": 1,
+  "threads_per_session": 12,
+  "cache": { "hits": 26, "misses": 8, "entries": 8 }
+}
+```
+
+### `POST /v1/systemone`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `state` | `string \| object` | ✅ | Context to evaluate (text or JSON) |
+| `questions` | `map<string, QuestionDef>` | ✅ | One or more typed questions (max 255 options per `choice`) |
+| `model` | `string` | ❌ | Optional model identifier echoed back |
+
+**Response body:**
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `string` | Model identifier |
+| `answers` | `map<string, Answer>` | One answer per question key |
+| `usage.input_tokens` | `int` | Total input tokens across all questions |
+| `usage.output_tokens` | `int` | Number of questions answered |
+
+### Error responses
+
+| Status | Meaning |
+|---|---|
+| `401` | Missing or invalid API key (only when `LAYA_API_KEY` / `--api-key` is set) |
+| `422` | Invalid request body (missing `state`/`questions`, malformed JSON) |
+| `404` | Unknown endpoint |
+| `413` | Request body too large |
+| `500` | Internal inference error (tokenizer, ONNX session, tensor extraction) |
+
+---
+
+## ⚡ Performance
+
+Measured on 12-core Snapdragon X (release build), prompt ~114 tokens, single question:
+
+| Condition | Latency | Throughput |
+|---|---|---|
+| Cold machine, miss (new inference) | **~233ms** | **~4.3 req/s** |
+| Cache hit (identical request) | **~1-2ms** | **~1000 req/s** |
+| Sustained load (SoC thermal throttle) | ~1000ms | ~1 req/s |
+| Real KV cache sustained (prefix cache) | **129ms median** | **~7.8 req/s** (8.5× vs single-pass) |
+
+CI (GitHub Actions, 2-4 vCPU runners, release): 8/8 platforms green. See `tools/bench-concurrent.js` and `tools/quick-check.js` output in the Actions logs for per-platform numbers.
+
+---
+
+## 🔧 Server Configuration
+
+All flags are CLI arguments (no env vars required except `LAYA_API_KEY`):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model-dir` | `models` | Directory with `embed_tokens_q4.onnx`, `decoder_model_merged_q4.onnx`, `tokenizer.json` |
+| `--host` | `127.0.0.1` | Bind host |
+| `--port` | `8093` | Bind port (0 = pick free port) |
+| `--workers` | `0` (auto = 1) | Concurrent inference workers (ONNX session pairs) |
+| `--threads` | `0` (auto = cpus/workers) | Intra-op threads per worker |
+| `--api-key` | unset | Bearer API key (or `LAYA_API_KEY` env var) |
+| `--temperature` | `1.14` | Softmax temperature for probability calibration |
+| `--cache-size` | `512` | Exact-match cache entries (0 = disabled) |
+| `--cache-ttl` | `600` | Exact-match cache TTL in seconds |
+| `--kv-cache-size` | `64` | KV-prefix cache entries (0 = disabled) |
+| `--prefix-cache` | `on` | Real KV cache (`on`/`off`) |
+
+---
+
+## 🧪 Development
+
+```bash
+# 10-question triage smoke test (spawns server, validates answers)
+node tools/quick-check.js
+
+# Concurrent throughput benchmark (levels 1,2,4,8 + cache-hit phase)
+node tools/bench-concurrent.js --levels 1,2,4 --requests 8
+
+# Build native binary
+cargo build --release --manifest-path native/qwen-serve/Cargo.toml
+
+# Trigger CI builds on all 8 platforms
+gh workflow run build-packages.yml
+```
+
+---
+
+## 🙏 Credits
+
+- **Base model:** [Qwen 3.5 0.8B](https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX-OPT) by Alibaba Qwen Team (Apache 2.0).
+- **ONNX export:** [onnx-community](https://huggingface.co/onnx-community) — `Qwen3.5-0.8B-ONNX-OPT` (embed_tokens + decoder_model_merged layout).
+- **Training recipe:** [Mapika/decider](https://github.com/Mapika/decider) (Apache 2.0) — mixture builder, Brier loss, temperature calibration.
+- **Wire protocol:** [TypeSafe Jev](https://docs.typesafe.ai/concepts/system-one) `/v1/systemone` specification.
+- **Reference implementations:** [convai/laya-system-one](https://github.com/convai/laya-system-one) (ModernBERT encoder), [kirp/jpt-0.8b](https://huggingface.co/kirp/jpt-0.8b) (LoRA on Qwen 3.5).
+
 ## 📜 License
 
 Apache 2.0. Base model weights based on [Qwen 3.5](https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX-OPT) by Alibaba Qwen Team.
