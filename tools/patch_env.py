@@ -97,6 +97,35 @@ def main():
             except Exception:
                 pass
 
+    # 4. Patch direto em tasks.py do optimum para registrar qwen3_5_text
+    task_paths = [
+        os.path.join(sysconfig.get_path("purelib"), "optimum", "exporters", "tasks.py"),
+        os.path.join(sysconfig.get_path("platlib"), "optimum", "exporters", "tasks.py"),
+    ] + glob.glob("/usr/local/**/optimum/exporters/tasks.py", recursive=True)
+
+    for p in set(task_paths):
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = f.read()
+                patch_alias = (
+                    "\n# Auto-patch qwen3_5_text alias\n"
+                    "try:\n"
+                    "    if 'qwen3_5_text' not in TasksManager._SUPPORTED_MODEL_TYPE:\n"
+                    "        for ref in ['qwen3_5', 'qwen2', 'qwen2_5', 'llama']:\n"
+                    "            if ref in TasksManager._SUPPORTED_MODEL_TYPE:\n"
+                    "                TasksManager._SUPPORTED_MODEL_TYPE['qwen3_5_text'] = TasksManager._SUPPORTED_MODEL_TYPE[ref]\n"
+                    "                break\n"
+                    "except Exception:\n"
+                    "    pass\n"
+                )
+                if "Auto-patch qwen3_5_text alias" not in content:
+                    with open(p, "a", encoding="utf-8") as f:
+                        f.write(patch_alias)
+                    print(f"[patch] TasksManager qwen3_5_text alias injetado em: {p}")
+            except Exception:
+                pass
+
     print("[patch] Ambiente compatibilizado com sucesso!")
 
 
