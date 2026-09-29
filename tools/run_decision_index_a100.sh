@@ -52,22 +52,30 @@ else
 fi
 
 # 5. Executar a avaliação oficial contra o servidor GPU A100!
+OUT_DIR="/content/decision_benchmark/runs/qwen-system-one-v1.1"
+mkdir -p "$OUT_DIR"
+
 echo "[4/4] Executando benchmark oficial Jev Decision Index (120k requisicoes na A100)..."
+if [ -f "$OUT_DIR/results.jsonl" ]; then
+    count=$(wc -l < "$OUT_DIR/results.jsonl")
+    echo "  -> Retomando de resultados anteriores: $count requisicoes ja concluidas!"
+fi
+
 python3 -m decision_index run \
     --edition 0.2.1 \
     --engine http \
     --option base_url=http://127.0.0.1:8093 \
     --option model=qwen-system-one \
     --rows "$SUITE_WORK/artifacts/benchmark-suite/release-v2-rebuilt/selected-rows.jsonl.gz" \
-    --out /content/runs/qwen-system-one-a100-v1.1
+    --out "$OUT_DIR"
 
 # Calcular e exibir os scores oficiais
 echo ""
 echo "Calculando Decision Index score oficial..."
 python3 -m decision_index score \
     --edition 0.2.1 \
-    --results /content/runs/qwen-system-one-a100-v1.1/results.jsonl \
-    --out /content/runs/qwen-system-one-a100-v1.1
+    --results "$OUT_DIR/results.jsonl" \
+    --out "$OUT_DIR"
 
 echo ""
 echo "================================================================="
