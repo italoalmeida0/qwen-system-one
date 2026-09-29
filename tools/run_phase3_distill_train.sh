@@ -15,13 +15,25 @@ if [ -z "$MIMO_API_KEY" ]; then
     exit 1
 fi
 
-BASE_DIR="/content/qwen-system-one"
 DRIVE_DIR="/content/drive/MyDrive/qwen-system-one"
+if [ ! -d "$DRIVE_DIR" ]; then
+    DRIVE_DIR="/content/drive/MyDrive"
+fi
+
+if [ -d "/content/qwen-system-one" ]; then
+    BASE_DIR="/content/qwen-system-one"
+    cd "$BASE_DIR"
+    git pull origin main || true
+elif [ -d "/content/drive/MyDrive/qwen-system-one" ]; then
+    BASE_DIR="/content/drive/MyDrive/qwen-system-one"
+    cd "$BASE_DIR"
+else
+    BASE_DIR="."
+    cd "$BASE_DIR"
+fi
+
 DATA_DIR="$DRIVE_DIR/data"
 mkdir -p "$DATA_DIR"
-
-cd "$BASE_DIR"
-git pull origin main || true
 
 echo "[*] Instalando bibliotecas necessarias para DPO na A100..."
 pip install -q trl peft accelerate transformers
