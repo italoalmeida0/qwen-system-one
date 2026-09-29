@@ -26,6 +26,16 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Patch de compatibilidade: versões do onnx que buscam float4_e2m1fn no ml_dtypes
+import numpy as np
+try:
+    import ml_dtypes
+    for attr in ["float4_e2m1fn", "float4_e2m1"]:
+        if not hasattr(ml_dtypes, attr):
+            setattr(ml_dtypes, attr, np.uint8)
+except ImportError:
+    pass
+
 
 def quantize_to_q4(in_onnx: Path, out_onnx: Path, block_size: int = 32):
     """Quantiza um modelo ONNX para 4-bit (MatMulNBits) e salva com dados externos."""
