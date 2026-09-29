@@ -41,6 +41,19 @@ try:
 except ImportError:
     pass
 
+# Patch de compatibilidade: get_parameter_dtype removido no transformers 5, exigido pelo optimum
+try:
+    import transformers.modeling_utils
+    if not hasattr(transformers.modeling_utils, "get_parameter_dtype"):
+        def get_parameter_dtype(parameter):
+            try:
+                return next(parameter.parameters()).dtype
+            except Exception:
+                return getattr(parameter, "dtype", None)
+        transformers.modeling_utils.get_parameter_dtype = get_parameter_dtype
+except Exception:
+    pass
+
 
 def quantize_to_q4(in_onnx: Path, out_onnx: Path, block_size: int = 32):
     """Quantiza um modelo ONNX para 4-bit (MatMulNBits) e salva com dados externos."""
